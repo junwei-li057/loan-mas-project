@@ -30,6 +30,7 @@ model             = saved["model"]
 NUM_FEATURES      = saved["features"]
 BEST_STRATEGY     = saved["best_strategy"]
 GRADE_TRAIN_STATS = saved.get("grade_train_stats", {})
+GATING_PARAMS     = saved.get("gating_params", None)   # Tier-A learned gate, if trained
 
 # ── Math helpers ──────────────────────────────────────────────────────────────
 def logit(p):
@@ -38,6 +39,33 @@ def logit(p):
 
 def sigmoid(x):
     return float(1 / (1 + np.exp(-x)))
+
+def gate_text_weight(grade, baseline_p, text_risk, text_conf):
+    """
+    Apply the Tier-A learned gate to a single case → text_weight ∈ [0, max_weight].
+    Mirrors GreenAgent.train_gating's gate_predict closure with one-row inputs.
+    Returns None if no gate was trained (pkl has no 'gating_params').
+    """
+    if GATING_PARAMS is None:
+        return None
+    grades     = GATING_PARAMS['grades']
+    mu         = np.asarray(GATING_PARAMS['mu'])
+    std        = np.asarray(GATING_PARAMS['std'])
+    w          = np.asarray(GATING_PARAMS['w'])
+    b          = float(GATING_PARAMS['b'])
+    max_weight = float(GATING_PARAMS['max_weight'])
+
+    grade_oh = np.zeros(len(grades))
+    if grade in grades:
+        grade_oh[grades.index(grade)] = 1.0
+    nonbin = np.array([
+        baseline_p, text_conf, text_risk,
+        abs(text_risk - 0.5), abs(baseline_p - 0.5), abs(text_risk - baseline_p),
+    ])
+    nonbin_std = (nonbin - mu) / std
+    feats      = np.concatenate([grade_oh, nonbin_std])
+    gate_raw   = float(feats @ w + b)
+    return max_weight * (1.0 / (1.0 + np.exp(-gate_raw)))
 
 def _stable_pick(options, key):
     return options[sum(ord(c) for c in str(key)) % len(options)]
@@ -143,7 +171,7 @@ def text_analyst(desc_text: str) -> dict:
         "→ 0.45 - 0.15 - 0.10 - 0.10 = 0.10 → clamp to 0.15\n"
         "  'Behind on rent, multiple maxed cards, no job.' "
         "→ 0.45 + 0.12 + 0.08 + 0.10 = 0.75\n\n"
-        "Output a single JSON object and nothing else:\n"
+        "CRITICAL OUTPUT FORMAT: respond with ONLY the JSON object. No reasoning, no markdown code fences, no commentary. Your response must start with { and end with }. Any text outside the JSON braces will break the parser.\n\n" + "Output a single JSON object and nothing else:\n"
         '{"text_risk_score": <computed float>,\n'
         ' "confidence": <float 0.4-0.95>,\n'
         ' "risk_signals": [<up to 3 exact quoted phrases from the description>],\n'
@@ -155,7 +183,7 @@ def text_analyst(desc_text: str) -> dict:
         "sentence with no income, employment, repayment plan, or purpose detail should be "
         "at most 0.55-0.62."
     )
-    llm_raw = call_llm(prompt, max_tokens=350, temperature=0.1)
+    llm_raw = call_llm(prompt, max_tokens=800, temperature=0.1)
     # Strip markdown code block if LLM wraps output in ```json ... ```
     cleaned = re.sub(r"^```(?:json)?\s*", "", llm_raw.strip())
     cleaned = re.sub(r"\s*```$", "", cleaned.strip())
@@ -174,7 +202,7 @@ def text_analyst(desc_text: str) -> dict:
 
 def reporter(row_dict, baseline, fused, grade, text_score, text_reasoning,
              effective_weight, confidence=0.0, veto_active=False, hist_delta=0.0,
-             threshold=0.62):
+             threshold=0.5):
     delta = fused - baseline
     abs_pp = abs(delta) * 100
     margin_pp = abs(fused - threshold) * 100
@@ -241,13 +269,22 @@ def reporter(row_dict, baseline, fused, grade, text_score, text_reasoning,
         "If the movement is around 0.01, explain its practical meaning only if it is close enough to affect review priority. "
         "Avoid filler phrases like 'presents a borderline case', 'provides reassurance', or 'moderate level of risk' unless tied to specific evidence."
     )
-    return call_llm(prompt, max_tokens=260, temperature=0.25)
+    return call_llm(prompt, max_tokens=800, temperature=0.25)
 
 def run_strategist_llm(grade, baseline_pred, text_score, text_confidence,
-                       learned_w, train_stats, desc_text, threshold=0.62):
+                       learned_w, train_stats, desc_text, threshold=0.5,
+                       gate_mode=False):
     """
     LLM Strategist: reads the full conflict context, outputs a rich strategy object.
     Called only when genuine conflict or complexity is detected.
+
+    Two modes:
+      • gate_mode=False (static, 5-scalar): learned_w is a conservative grade-level
+        default. Strategist proposes case-specific INCREASES when text deserves
+        extra influence.
+      • gate_mode=True  (Tier-A gate): learned_w is already per-case (gate output).
+        Strategist may propose deviations in EITHER direction when the description
+        contains case-specific cues the gate cannot read.
     """
     hist_delta   = train_stats.get("delta_at_high_weight", 0.0)
     hist_reason  = train_stats.get("reason", "unknown")
@@ -256,10 +293,54 @@ def run_strategist_llm(grade, baseline_pred, text_score, text_confidence,
     score_gap    = round(text_score - baseline_pred, 3)
     near_threshold = abs(baseline_pred - threshold) < 0.05
 
+    if gate_mode:
+        baseline_w_desc = (
+            f"Per-row text weight from learned gate: {learned_w:.3f}\n"
+            f"Gate inputs it already considered: grade={grade}, baseline_p={baseline_pred:.3f}, "
+            f"text_risk={text_score:.3f}, text_conf={text_confidence:.3f}, plus their absolute deviations.\n"
+            f"The gate is a learned per-row policy: it tends to give HIGH weight to protective text "
+            f"(text_risk far below 0.5 with good confidence) and LOW weight to risky text "
+            f"(so the model doesn't double-count risk). It has already produced a thoughtful "
+            f"per-case weight from the structured features."
+        )
+        weight_rules = (
+            "DECISION FRAMEWORK (read carefully):\n"
+            "  1. Read the borrower's description prose below. Ask yourself: does it contain CASE-SPECIFIC "
+            "evidence — employer reputation, repayment-plan specifics, life-event context, urgency cues, "
+            "contradictions with the numeric profile — that the gate's structured features cannot see?\n"
+            "  2. If NO (most cases): choose `keep_learned`, set proposed_weight = the gate's value "
+            f"({learned_w:.3f}), and the rationale should say so honestly. Do NOT invent a reason to deviate "
+            "just because you were invoked. The gate already did the work.\n"
+            "  3. If YES: choose `case_specific_exception` and propose a deviation. The direction must "
+            "match what the prose tells you — say 'reduce' if proposed < learned, 'increase' if proposed > learned. "
+            "Cite the specific phrase from the description that drove your judgment.\n"
+            "  4. proposed_weight must be in [0.00, 0.60] and within ±0.15 of the gate's value.\n"
+            "  5. Do NOT set max_prediction_shift or other constraints unless you genuinely need to limit downstream "
+            "impact — they are NOT required. The gate already calibrates per case; piling constraints on top of "
+            "your own proposed weight creates self-contradictions.\n"
+        )
+    else:
+        baseline_w_desc = (
+            f"Static learned text weight (grade-level): {learned_w:.2f}\n"
+            f"Historical text impact: {history_summary}\n"
+            f"Reason: {hist_reason}"
+        )
+        weight_rules = (
+            "- The static weight is conservative grade policy. case_specific_exception or fuzzy_only "
+            "means propose an INCREASE above this baseline when the case warrants extra text influence.\n"
+            "- proposed_weight should be ≥ learned when you choose case_specific_exception or fuzzy_only; "
+            "equal to learned for keep_learned / explanation_only / human_review.\n"
+            "- Use a modest increase when historical text impact is unstable or harmful, because the "
+            "Advocate may veto and Green will then arbitrate.\n"
+            "- proposed_weight must be in [0.00, 0.20].\n"
+        )
+
     prompt = (
         "You are the Feature Strategist in a loan default prediction multi-agent system.\n"
         "Your job is to propose a strategy for how the text risk score should influence the final prediction.\n"
         "You must reason carefully — you are not a rule engine.\n\n"
+        f"=== Mode ===\n"
+        f"Baseline-weight source: {'Tier-A learned gate (per-row)' if gate_mode else 'Static grade-level policy'}\n\n"
         f"=== Current case context ===\n"
         f"Grade: {grade}\n"
         f"Numeric baseline prediction: {baseline_pred:.3f} (threshold = {threshold})\n"
@@ -267,36 +348,32 @@ def run_strategist_llm(grade, baseline_pred, text_score, text_confidence,
         f"Score gap (text - baseline): {score_gap:+.3f}\n"
         f"Baseline in fuzzy zone [0.30–0.65]: {'YES' if in_fuzzy else 'NO'}\n"
         f"Near decision threshold (±0.05): {'YES' if near_threshold else 'NO'}\n\n"
-        f"=== Training history for Grade {grade} ===\n"
-        f"Learned text weight: {learned_w:.2f}\n"
-        f"Historical text impact: {history_summary}\n"
-        f"Reason: {hist_reason}\n\n"
+        f"=== Baseline text weight ===\n"
+        f"{baseline_w_desc}\n\n"
         f"=== Borrower description snippet ===\n{desc_text[:300]}\n\n"
         "Choose ONE strategy_type:\n"
-        "  keep_learned          — text and policy are consistent, no change needed\n"
-        "  case_specific_exception — allow limited text weight despite learned policy (use with constraints)\n"
-        "  fuzzy_only            — apply text weight only if baseline is in fuzzy zone [0.30–0.65]\n"
+        "  keep_learned          — baseline weight is already appropriate, no change needed\n"
+        "  case_specific_exception — deviate from baseline because of description-level cues (use constraints)\n"
+        "  fuzzy_only            — deviation applies only because baseline is in fuzzy zone [0.30–0.65]\n"
         "  explanation_only      — text informs the Reporter narrative but does NOT change weight\n"
         "  human_review          — flag for human review; do not change prediction\n\n"
         "For case_specific_exception or fuzzy_only, you may set constraints:\n"
         "  max_prediction_shift: maximum allowed change from baseline (e.g. 0.05)\n"
         "  min_text_confidence: minimum confidence required (e.g. 0.85)\n\n"
         "Rules:\n"
-        "- The Advocate will reason about grade-level historical text impact; you may propose case_specific_exception or fuzzy_only, but Advocate may veto if text has historically harmed similar cases.\n"
-        "- If text confidence < 0.70, prefer explanation_only or keep_learned.\n"
-        "- If you choose keep_learned, explanation_only, or human_review, proposed_weight should equal the learned text weight.\n"
-        "- If you choose case_specific_exception or fuzzy_only, proposed_weight must be your intended operational text weight, not a placeholder. It should be greater than the learned text weight when you want text to have extra influence; choose the increase yourself based on confidence, score gap, fuzzy-zone status, and historical AUC risk.\n"
-        "- Use a modest increase when historical text impact is unstable or harmful, because the Advocate may veto or send it to Arbitrator.\n"
-        "- proposed_weight must be in [0.00, 0.20].\n\n"
-        "Style: make the rationale specific to this case; avoid generic phrases such as "
+        "- The Advocate will reason about grade-level historical text impact and may soft-veto; Green then arbitrates.\n"
+        "- If you choose keep_learned, explanation_only, or human_review, proposed_weight should equal the baseline text weight (the value shown above).\n"
+        + weight_rules +
+        "\nStyle: make the rationale specific to this case; avoid generic phrases such as "
         "'text confidence is high' unless you connect them to the numeric context.\n\n"
-        "CRITICAL: Your entire response must be ONLY a JSON object. "
-        "No explanation before or after it. Start with { and end with }.\n\n"
+        "CRITICAL OUTPUT FORMAT: respond with ONLY the JSON object. "
+        "No reasoning, no markdown code fences, no commentary. "
+        "Your response must start with { and end with }. Any text outside the JSON braces will break the parser.\n\n"
         '{"strategy_type": "<type>", "proposed_weight": <float>, '
         '"constraints": {"max_prediction_shift": <float or null>, "min_text_confidence": <float or null>, '
         '"only_if_fuzzy_zone": <true/false>}, "rationale": "<one sentence>"}'
     )
-    raw = call_llm(prompt, max_tokens=250, temperature=0.2)
+    raw = call_llm(prompt, max_tokens=800, temperature=0.2)
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     cleaned = re.sub(r"\s*```$", "", cleaned.strip())
     try:
@@ -305,14 +382,20 @@ def run_strategist_llm(grade, baseline_pred, text_score, text_confidence,
         result = {"strategy_type": "keep_learned", "proposed_weight": learned_w,
                   "constraints": {}, "rationale": "[parse error — defaulting to learned strategy]"}
 
-    # Enforce hard safety: never exceed learned weight by more than 0.15
-    result["proposed_weight"] = round(min(max(float(result.get("proposed_weight", learned_w)), 0.0), learned_w + 0.15), 3)
+    # Safety clamp: in gate mode allow ±0.15 either direction (cap [0, 0.6]);
+    # in static mode keep the legacy upward-only ceiling of learned + 0.15 (cap [0, 0.2]).
+    proposed = float(result.get("proposed_weight", learned_w))
+    if gate_mode:
+        lo, hi = max(0.0, learned_w - 0.15), min(0.6, learned_w + 0.15)
+    else:
+        lo, hi = 0.0, min(0.20, learned_w + 0.15)
+    result["proposed_weight"] = round(min(max(proposed, lo), hi), 3)
     return result, raw
 
 def run_advocate_llm(grade, baseline_pred, text_score, confidence,
                      learned_w, proposed_w, hist_delta, hist_reason,
                      strategist_type, strategist_rationale, strategist_constraints,
-                     desc_text, threshold=0.62):
+                     desc_text, threshold=0.5):
     """
     Intelligent Advocate: reasons about subgroup reliability and current-case evidence.
     Deterministic severe-harm floors are enforced outside this function.
@@ -368,12 +451,12 @@ def run_advocate_llm(grade, baseline_pred, text_score, confidence,
         "soft_veto means reduced influence, not reverting to the learned weight. "
         "Use learned_weight only for hard_veto.\n\n"
         "Style: write the rationale in varied, case-specific language. Do not merely echo the historical-impact phrase.\n\n"
-        'Output only JSON: {"decision": "<pass|soft_veto|hard_veto>", '
+        "CRITICAL OUTPUT FORMAT: respond with ONLY the JSON object. No reasoning, no markdown code fences, no commentary. Your response must start with { and end with }. Any text outside the JSON braces will break the parser.\n\n" + 'Output only JSON: {"decision": "<pass|soft_veto|hard_veto>", '
         '"severity": "<low|medium|high>", "max_allowed_weight": <float>, '
         '"max_prediction_shift": <float or null>, "rationale": "<one sentence using historical impact language, not AUC numbers>", '
         '"constraints": ["<short constraint>", "..."]}'
     )
-    raw = call_llm(prompt, max_tokens=320, temperature=0.2)
+    raw = call_llm(prompt, max_tokens=800, temperature=0.2)
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     cleaned = re.sub(r"\s*```$", "", cleaned.strip())
     try:
@@ -411,7 +494,7 @@ def run_advocate_llm(grade, baseline_pred, text_score, confidence,
         result["rationale"] = (
             f"For Grade {grade}, {historical_text_impact(hist_delta, grade)}. "
             "Because this borrower sits close to the decision boundary, the Advocate "
-            "does not reject the text but asks the Arbitrator to keep its extra influence narrow."
+            "does not reject the text but asks Green to arbitrate it down to a narrower influence."
         )
         result["constraints"] = [
             "arbitrator review near threshold",
@@ -425,7 +508,7 @@ def run_advocate_llm(grade, baseline_pred, text_score, confidence,
         result["severity"] = "medium"
         result["rationale"] = (
             f"For Grade {grade}, {historical_text_impact(hist_delta, grade)}. "
-            "The borrower narrative is usable, but the Advocate requires the Arbitrator "
+            "The borrower narrative is usable, but the Advocate requires Green to arbitrate "
             "to narrow the extra text influence before it reaches final fusion."
         )
         result["constraints"] = [
@@ -463,7 +546,7 @@ def run_advocate_llm(grade, baseline_pred, text_score, confidence,
 
 def run_green_llm(baseline_pred, fused_before, fused_after, text_score,
                   confidence, grade, green_action, green_notes,
-                  strat_rationale, hist_delta, threshold=0.62):
+                  strat_rationale, hist_delta, threshold=0.5):
     """
     Green Agent LLM — final authority review for contested edge cases.
     Called only when hard rules fire on borderline evidence.
@@ -477,34 +560,41 @@ def run_green_llm(baseline_pred, fused_before, fused_after, text_score,
 
     prompt = (
         "You are the Green Agent — the final authority in a loan default prediction system.\n"
-        "White Agents (Text Analyst, Strategist, Advocate, Arbitrator) have completed their pipeline.\n"
-        "Your hard rules then fired and produced a contested outcome. You must now make the terminal call.\n\n"
+        "White Agents (Text Analyst, Strategist, Advocate) finished their pipeline and produced a fused score; "
+        "Green's flip gate then blocked the verdict change. You must decide whether to confirm or reverse "
+        "that block.\n\n"
         f"=== Case context ===\n"
         f"Credit grade: {grade} | Decision threshold: {threshold}\n"
-        f"Numeric baseline: {baseline_pred:.3f}\n"
-        f"Fused after White Agents: {fused_before:.3f}"
-        + (f" → would flip verdict ({flip_direction})\n" if flip_direction else "\n")
-        + f"After Green hard rules: {fused_after:.3f} (rule: {green_action})\n"
-        f"Rule reason: {'; '.join(green_notes) if green_notes else 'none'}\n\n"
-        f"=== Evidence ===\n"
-        f"Text risk score: {text_score:.3f} | LLM confidence: {confidence:.3f}\n"
-        f"Grade {grade} training AUC delta at high weight: {hist_delta:+.3f}\n"
-        f"Strategist rationale: {strat_rationale}\n\n"
-        "=== Your task ===\n"
-        "Decide whether Green's hard rule was appropriate or too conservative.\n"
-        "Choose one of:\n"
-        "  accept_baseline — confirm override, keep baseline\n"
-        "  accept_fused    — reverse override, use White Agent fused value\n"
-        "  custom          — propose a value between baseline and fused (inclusive)\n\n"
-        "Constraints:\n"
-        f"- If hist_delta < -0.01 for this grade, text evidence is unreliable → prefer accept_baseline\n"
-        f"- If confidence < 0.75 → prefer accept_baseline\n"
-        f"- custom final_pred must be within [{min(baseline_pred, fused_before):.3f}, "
-        f"{max(baseline_pred, fused_before):.3f}]\n\n"
-        f'Output only JSON: {{"decision": "<accept_baseline|accept_fused|custom>", '
-        f'"final_pred": <float>, "reasoning": "<one sentence>"}}'
+        f"Numeric baseline: {baseline_pred:.3f} ({'DEFAULT' if baseline_pred >= threshold else 'NON-DEFAULT'})\n"
+        f"Fused after White Agents: {fused_before:.3f} ({'DEFAULT' if fused_before >= threshold else 'NON-DEFAULT'})"
+        + (f" → flip detected ({flip_direction})\n" if flip_direction else "\n")
+        + f"After Green hard rules: {fused_after:.3f} (rule fired: {green_action})\n"
+        f"Rule note: {'; '.join(green_notes) if green_notes else 'none'}\n\n"
+        f"=== Text evidence ===\n"
+        f"Text risk score: {text_score:.3f}  (distance from 0.5: {abs(text_score - 0.5):.3f})\n"
+        f"LLM confidence: {confidence:.3f}\n"
+        f"Strategist rationale: {strat_rationale}\n"
+        f"Training-time AUC delta at high text weight for Grade {grade}: {hist_delta:+.3f} "
+        f"(positive = text historically helped this grade; negative = it has historically harmed)\n\n"
+        "=== Your judgment ===\n"
+        "You are the LAST checkpoint. The flip gate is a coarse safety check — it does not know about "
+        "the gating model's per-case reasoning. Your job is to weigh the actual evidence:\n"
+        "  • Was White Agents' shift backed by genuinely strong, internally consistent text evidence?\n"
+        "  • Or was it driven by noisy/over-confident text that should not flip a numeric verdict?\n"
+        "Use the numbers above to form your own conclusion. Do NOT default to one side; the data should drive you.\n\n"
+        "Choose ONE decision and provide reasoning that REFERENCES THE SPECIFIC NUMBERS above:\n"
+        "  accept_baseline — confirm the block; the flip should not happen\n"
+        "  accept_fused    — overturn the block; the fused value (before hard rules) stands\n"
+        "  custom          — settle on a value strictly between baseline and fused (rare)\n\n"
+        f"For `custom`, final_pred must be inside [{min(baseline_pred, fused_before):.3f}, "
+        f"{max(baseline_pred, fused_before):.3f}]. For accept_baseline use {baseline_pred:.3f}; "
+        f"for accept_fused use {fused_before:.3f}.\n\n"
+        "CRITICAL OUTPUT FORMAT: respond with ONLY the JSON object. No reasoning prose outside JSON, "
+        "no markdown code fences. Your response must start with { and end with }.\n\n"
+        f'{{"decision": "<accept_baseline|accept_fused|custom>", '
+        f'"final_pred": <float>, "reasoning": "<one sentence citing the specific numbers from above>"}}'
     )
-    raw = call_llm(prompt, max_tokens=220, temperature=0.2)
+    raw = call_llm(prompt, max_tokens=800, temperature=0.2)
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     cleaned = re.sub(r"\s*```$", "", cleaned.strip())
     try:
@@ -635,7 +725,7 @@ div[data-testid="stHorizontalBlock"] button {
 
 # ── Page header ───────────────────────────────────────────────────────────────
 st.markdown("## 🏦 Loan Default Prediction — Multi-Agent Demo")
-st.caption("XGBoost baseline · logit-space text fusion · 6-agent decision pipeline")
+st.caption("XGBoost baseline · logit-space text fusion · 5-agent decision pipeline (Arbitrator merged into Green)")
 
 # ── Preset scenario buttons ───────────────────────────────────────────────────
 st.markdown("**Quick-load demo case:**")
@@ -794,27 +884,39 @@ with col_output:
             # ── Agent 2: Feature Strategist (LLM) ────────────────────────────
             conf_threshold = BEST_STRATEGY["conf_threshold"]
             conf_ok        = confidence >= conf_threshold
-            learned_w      = BEST_STRATEGY["grade_weights"].get(grade, 0.0)
+            # Per-row text weight: Tier-A learned gate if available; else 5-scalar fallback.
+            gate_w         = gate_text_weight(grade, baseline_pred, raw_score, confidence)
+            if gate_w is not None:
+                learned_w      = float(gate_w)
+                learned_w_src  = "Tier-A gate"
+            else:
+                learned_w      = BEST_STRATEGY["grade_weights"].get(grade, 0.0)
+                learned_w_src  = "5-scalar BEST_STRATEGY"
             train_stats    = GRADE_TRAIN_STATS.get(grade, {})
 
-            # Trigger LLM Strategist when disagreement or decision uncertainty exists.
+            # Trigger LLM Strategist only when it can plausibly add value beyond
+            # the per-case weight already computed (by gate in Tier-A, or by static
+            # grade policy otherwise). The Strategist's distinctive ability is reading
+            # the borrower's PROSE — so it should fire when there is text-model
+            # disagreement (LLM can mediate) or, in static mode, when the static weight
+            # is mismatched with extreme text content.
             score_gap       = abs(raw_score - baseline_pred)
             baseline_fuzzy  = 0.30 <= baseline_pred <= 0.65
+            gate_mode       = (GATING_PARAMS is not None)
             strategist_triggers = []
             if score_gap > 0.20:
                 strategist_triggers.append("text-model disagreement")
-            if raw_score > 0.65 and learned_w == 0.0:
-                strategist_triggers.append("extreme text risk with suppressed grade weight")
-            if raw_score < 0.25 and learned_w > 0.10:
-                strategist_triggers.append("protective text under a high learned grade weight")
-            if baseline_fuzzy:
-                strategist_triggers.append("fuzzy-zone review")
-            call_strategist = conf_ok and (
-                score_gap > 0.20 or                          # strong text/numeric disagreement
-                (raw_score > 0.65 and learned_w == 0.0) or  # extreme text, suppressed grade
-                (raw_score < 0.25 and learned_w > 0.10) or  # protective text, high weight grade
-                baseline_fuzzy                               # numeric alone is uncertain
-            )
+            if not gate_mode:
+                # In static mode, baseline_fuzzy alone is meaningful because the static
+                # weight cannot react to context. In gate mode, the gate has already
+                # handled fuzzy zone via baseline_p as a feature — no extra trigger needed.
+                if baseline_fuzzy:
+                    strategist_triggers.append("fuzzy-zone review")
+                if raw_score > 0.65 and learned_w == 0.0:
+                    strategist_triggers.append("extreme text risk with suppressed grade weight")
+                if raw_score < 0.25 and learned_w > 0.10:
+                    strategist_triggers.append("protective text under a high learned grade weight")
+            call_strategist = conf_ok and bool(strategist_triggers)
 
             strat_result = None
             strat_raw    = None
@@ -827,6 +929,18 @@ with col_output:
                         st.metric(f"Grade {g}", f"{lw:.2f}",
                                   delta="← this grade" if g == grade else None,
                                   delta_color="normal" if g == grade else "off")
+
+                # Show baseline-weight source: learned Tier-A gate (per-row) vs 5-scalar default
+                if GATING_PARAMS is not None:
+                    static_w_for_grade = BEST_STRATEGY["grade_weights"].get(grade, 0.0)
+                    st.info(
+                        f"**Tier-A learned gate active** — per-row text weight for this case: "
+                        f"**{learned_w:.3f}**  (5-scalar default for Grade {grade} would be {static_w_for_grade:.2f}).  "
+                        f"Gate trained on {GATING_PARAMS.get('mean_text_weight_train', 0):.3f} mean weight across train set, "
+                        f"log-loss improvement {GATING_PARAMS.get('log_loss_improvement', 0):+.4f}."
+                    )
+                else:
+                    st.caption(f"Baseline weight source: **{learned_w_src}** (no Tier-A gate in pkl — re-run Tier-A cell to enable).")
 
                 st.markdown(f"**Confidence:** {confidence:.3f} {'✅' if conf_ok else '❌ below threshold → skip'}")
                 st.markdown(f"**Score gap** (text − baseline): `{raw_score:.3f} − {baseline_pred:.3f} = {raw_score-baseline_pred:+.3f}`")
@@ -843,7 +957,8 @@ with col_output:
                         t_s = time.time()
                         strat_result, strat_raw = run_strategist_llm(
                             grade, baseline_pred, raw_score, confidence,
-                            learned_w, train_stats, desc_text
+                            learned_w, train_stats, desc_text,
+                            gate_mode=gate_mode,
                         )
                         elapsed_s = time.time() - t_s
 
@@ -880,8 +995,14 @@ with col_output:
             cst        = strat_result.get("constraints", {})
 
             # Strategy types that propose a weight change go to Advocate
-            strategist_proposes_change = (stype in ("case_specific_exception", "fuzzy_only") and
-                                          proposed_w > learned_w + 0.001)
+            # In gate mode the Strategist may propose either direction (over- or under-correct
+            # the per-row gate). In static mode only upward proposals are meaningful.
+            if gate_mode:
+                strategist_proposes_change = (stype in ("case_specific_exception", "fuzzy_only") and
+                                              abs(proposed_w - learned_w) > 0.001)
+            else:
+                strategist_proposes_change = (stype in ("case_specific_exception", "fuzzy_only") and
+                                              proposed_w > learned_w + 0.001)
 
             # ── Agent 3: Subgroup Advocate ─────────────────────────────────────
             hist_delta     = train_stats.get("delta_at_high_weight", 0.0)
@@ -948,8 +1069,8 @@ with col_output:
                     if is_hard_veto:
                         st.markdown("**Hard veto — the reliability constraint is binding, so no compromise weight is allowed.**")
                     else:
-                        st.markdown("**Soft veto — Arbitrator can consider a narrower, case-specific weight.**")
-                    st.markdown(f"→ Forwarding to **Arbitrator**.")
+                        st.markdown("**Soft veto — Green will arbitrate a narrower, case-specific weight.**")
+                    st.markdown(f"→ Forwarding to **Green for arbitration**.")
                     if adv_raw:
                         with st.expander("🔍 Raw LLM output (Advocate)", expanded=False):
                             st.code(adv_raw, language="json")
@@ -975,11 +1096,11 @@ with col_output:
                         with st.expander("🔍 Raw LLM output (Advocate)", expanded=False):
                             st.code(adv_raw, language="json")
 
-            # ── Agent 4: Arbitrator ────────────────────────────────────────────
+            # ── Green Agent — Arbitration (on-veto) ──────────────────────────────
             final_w    = learned_w
             arb_source = "learned"
-            arb_label  = ("⚖️ White Agent 4 — Arbitrator (on-demand LLM)  🔔 called" if veto
-                          else "⚖️ White Agent 4 — Arbitrator (on-demand LLM)  — idle")
+            arb_label  = ("⚖️ Green Agent — Arbitration (on-veto)  🔔 called" if veto
+                          else "⚖️ Green Agent — Arbitration (on-veto)  — idle")
             with st.expander(arb_label, expanded=veto):
                 if veto:
                     st.caption("Called because Advocate vetoed. Classifies veto type, then mediates or enforces accordingly.")
@@ -996,7 +1117,7 @@ with col_output:
                         st.markdown(f"**Final weight for Grade {grade}: `{final_w:.2f}`** (no LLM call needed — constraint is absolute)")
                     else:
                         # Soft veto: call LLM for compromise
-                        arb_threshold = 0.62
+                        arb_threshold = 0.5
                         arb_text_evidence = logit(text_score_for_fusion) - logit(0.5)
                         arb_pred_learned = sigmoid(
                             logit(baseline_pred) + learned_w * confidence * arb_text_evidence
@@ -1047,7 +1168,7 @@ with col_output:
                             if exemption_applies else ""
                         )
                         arb_prompt = (
-                            f"You are the Arbitrator in a loan default prediction system.\n"
+                            f"You are the Green Agent acting as arbitrator in a loan default prediction system.\n"
                             f"Your role is to make a reasoned裁决, not to average the two sides.\n\n"
                             f"=== Dispute ===\n"
                             f"Strategist proposal: Grade {grade} text weight {learned_w:.3f} → {proposed_w:.3f}\n"
@@ -1092,17 +1213,17 @@ with col_output:
                             f"- Do not write generic evidence such as 'confidence is high' unless you tie it to concrete borrower facts.\n"
                             f"- final_weight must stay within the safety range [{arb_lo:.3f}, {arb_hi:.3f}], inclusive.\n\n"
                             f"Style: write like a careful credit-risk adjudicator. Be specific to this case; do not sound like a generic compromise template.\n\n"
-                            f'Respond with only JSON: {{"ruling": "<strategist|advocate|balanced>", '
+                            f"CRITICAL OUTPUT FORMAT: respond with ONLY the JSON object. No reasoning, no markdown code fences, no commentary. Your response must start with {{ and end with }}. Any text outside the JSON braces will break the parser.\n\n" + f'Respond with only JSON: {{"ruling": "<strategist|advocate|balanced>", '
                             f'"final_weight": <float>, '
                             f'"strategist_evidence": "<2 detailed sentences using numeric and text-specific facts>", '
                             f'"advocate_evidence": "<2 detailed sentences using numeric and text-specific facts>", '
                             f'"decision_basis": "<3-5 concrete factors used for the ruling>", '
                             f'"resolution": "<2 sentences explaining why this exact weight is justified for this borrower>"}}'
                         )
-                        with st.spinner("Arbitrator calling LLM for soft-veto compromise..."):
+                        with st.spinner("Green arbitrating soft-veto compromise..."):
                             t0 = time.time()
                             try:
-                                arb_raw     = call_llm(arb_prompt, max_tokens=520, temperature=0.25)
+                                arb_raw     = call_llm(arb_prompt, max_tokens=800, temperature=0.25)
                                 arb_cleaned = re.sub(r"^```(?:json)?\s*", "", arb_raw.strip())
                                 arb_cleaned = re.sub(r"\s*```$", "", arb_cleaned.strip())
                                 arb_result  = json.loads(re.search(r"\{.*\}", arb_cleaned, re.DOTALL).group(0))
@@ -1221,9 +1342,12 @@ with col_output:
 
         # ── Green Agent: Final Authority Check ───────────────────────────────
         # Green independently validates the fused result before verdict is issued.
-        # Two hard rules applied regardless of what White Agents proposed.
-        THRESHOLD    = 0.62
-        MAX_SHIFT    = 0.12   # text can shift at most 0.12 from baseline
+        # The shift cap is a safety rail for the static 5-scalar mode where weights
+        # are dumb constants; in gate mode the learned per-row policy IS the calibration
+        # of "how big a shift this case deserves", so the cap would just fight the gate.
+        THRESHOLD    = 0.5
+        # MAX_SHIFT = None in gate mode (gate self-calibrates); 0.12 in static mode.
+        MAX_SHIFT    = None if gate_mode else 0.12
 
         _fused_before_green = fused_pred
         green_action  = "accepted"
@@ -1232,8 +1356,8 @@ with col_output:
         if desc_text.strip() and effective_w > 0:
             shift = abs(fused_pred - baseline_pred)
 
-            # Rule 1 — max shift cap
-            if shift > MAX_SHIFT:
+            # Rule 1 — max shift cap (static mode only; gate is self-calibrating)
+            if MAX_SHIFT is not None and shift > MAX_SHIFT:
                 direction  = 1 if fused_pred > baseline_pred else -1
                 fused_pred = round(baseline_pred + direction * MAX_SHIFT, 4)
                 green_action = "shift_capped"
@@ -1272,7 +1396,8 @@ with col_output:
             st.caption("Independent of White Agents. Enforces hard rules on the fused result before verdict is issued.")
             col_g1, col_g2, col_g3 = st.columns(3)
             with col_g1: st.metric("Fused (pre-check)", f"{_fused_before_green:.3f}")
-            with col_g2: st.metric("Max allowed shift", f"±{MAX_SHIFT}")
+            with col_g2: st.metric("Max allowed shift",
+                                   f"±{MAX_SHIFT}" if MAX_SHIFT is not None else "gate-calibrated")
             with col_g3: st.metric("Fused (post-check)", f"{fused_pred:.3f}",
                                    delta=f"{fused_pred-_fused_before_green:+.3f}" if fused_pred != _fused_before_green else "unchanged",
                                    delta_color="off")
@@ -1286,12 +1411,21 @@ with col_output:
                         st.success(note)
             else:
                 st.success(f"Fused score {fused_pred:.3f} within bounds. No intervention needed.")
-            st.markdown(
-                "**Green's two hard rules:**\n"
-                f"1. Shift cap: |fused − baseline| ≤ {MAX_SHIFT} — prevents text from dominating the numeric model\n"
-                "2. Flip gate: verdict reversal requires high LLM confidence **and** extreme text signal "
-                "(asymmetric: clearing a predicted default requires stronger evidence than raising one)"
-            )
+            if MAX_SHIFT is not None:
+                st.markdown(
+                    "**Green's two hard rules:**\n"
+                    f"1. Shift cap: |fused − baseline| ≤ {MAX_SHIFT} — static-mode safety rail (5-scalar weights can't self-calibrate)\n"
+                    "2. Flip gate: verdict reversal requires high LLM confidence **and** extreme text signal "
+                    "(asymmetric: clearing a predicted default requires stronger evidence than raising one)"
+                )
+            else:
+                st.markdown(
+                    "**Green's hard rule (gate mode):**\n"
+                    "1. ~~Shift cap~~ — disabled. The Tier-A learned gate is per-case calibrated; "
+                    "if it produces a large shift, that is the gate's design intent, not an anomaly.\n"
+                    "2. Flip gate: verdict reversal requires high LLM confidence **and** extreme text signal "
+                    "(asymmetric: clearing a predicted default requires stronger evidence than raising one)"
+                )
 
         # ── Green Agent LLM — edge-case terminal review ──────────────────────
         # Trigger 1: flip_blocked but evidence is near-miss
@@ -1362,7 +1496,7 @@ with col_output:
 
                 fused_pred = final_pred
 
-        # ── Agent 5: Reporter ─────────────────────────────────────────────────
+        # ── Agent 4: Reporter ─────────────────────────────────────────────────
         FUZZY_LO, FUZZY_HI = 0.30, 0.65
         threshold      = THRESHOLD
         in_fuzzy       = FUZZY_LO <= fused_pred <= FUZZY_HI
@@ -1374,7 +1508,7 @@ with col_output:
         _hist_for_reporter   = hist_delta  if desc_text.strip() else 0.0
 
         reporter_exp = st.expander(
-            f"📊 White Agent 5 — Reporter (LLM) {'🔔 triggered' if in_fuzzy else '— not triggered'}",
+            f"📊 White Agent 4 — Reporter (LLM) {'🔔 triggered' if in_fuzzy else '— not triggered'}",
             expanded=in_fuzzy,
         )
         with reporter_exp:
@@ -1434,7 +1568,7 @@ with col_output:
                 f"| ⚙️ Strategist | Proposed weight `{learned_w:.2f} → {proposed_w:.2f}` |\n"
                 f"| 🛡️ Advocate | **{'Hard' if is_hard_veto else 'Soft'} veto** — "
                 f"{historical_text_impact(hist_delta, grade)} |\n"
-                f"| ⚖️ Arbitrator | {'Hard veto enforced' if is_hard_veto else 'Soft compromise accepted'} |\n"
+                f"| ⚖️ Green Arbitrate | {'Hard veto enforced' if is_hard_veto else 'Soft compromise accepted'} |\n"
                 f"| 🟢 Green | Numeric-driven. fused = baseline = **{fused_pred:.3f}** |"
             )
             st.markdown(summary_md)
@@ -1471,7 +1605,7 @@ with col_output:
                                delta=f"{fused_pred-baseline_pred:+.3f}" if text_score_raw else None,
                                delta_color="inverse")
         with col_v4: st.metric("Margin from threshold", f"{margin:.3f}",
-                               help="Distance from 0.62. < 0.03 = fragile.")
+                               help="Distance from 0.5. < 0.03 = fragile.")
 
         if fragility_flags:
             st.markdown("**⚠️ Fragility flags:**")
@@ -1489,8 +1623,8 @@ with col_output:
                       f'<span class="pipe-chip chip-warn">🛡️ Advocate ⚠️</span>'   if (has_text and veto) else
                       f'<span class="pipe-chip chip-ok">🛡️ Advocate ✓</span>'     if has_text else
                       f'<span class="pipe-chip chip-idle">🛡️ Advocate —</span>')
-        arb_chip   = (f'<span class="pipe-chip chip-warn">⚖️ Arbitrator 🔔</span>' if (has_text and veto) else
-                      f'<span class="pipe-chip chip-idle">⚖️ Arbitrator —</span>')
+        arb_chip   = (f'<span class="pipe-chip chip-warn">⚖️ Green Arbitrate 🔔</span>' if (has_text and veto) else
+                      f'<span class="pipe-chip chip-idle">⚖️ Green Arbitrate —</span>')
         grn_chip   = (f'<span class="pipe-chip chip-alert">🟢 Green 🛑</span>'    if green_action == "flip_blocked" else
                       f'<span class="pipe-chip chip-warn">🟢 Green ⚠️</span>'     if green_action == "shift_capped" else
                       f'<span class="pipe-chip chip-ok">🟢 Green ✓</span>')

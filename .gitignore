@@ -34,3 +34,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Executed notebook with API outputs (regenerate locally, do not commit)
+notebooks/loan_default_executed.ipynb

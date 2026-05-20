@@ -1,6 +1,18 @@
 # Loan Default — Multi-Agent Demo
 
-A multi-agent loan-default scoring system. An XGBoost baseline produces a numerical PD, and several LLM "agents" (text analyst, grade analyst, green/ESG reviewer, etc.) audit the application and fuse their judgments with the model probability in logit space. A Streamlit app provides an interactive demo.
+A multi-agent loan-default scoring system. An XGBoost baseline produces a numerical PD on Grade C–G loans; a panel of LLM agents reads the borrower's free-text description, audits the proposed weight changes, and fuses text-derived risk with the model probability in logit space. A Streamlit app provides an interactive demo.
+
+## Agent architecture
+
+| Role | Type | Job |
+|---|---|---|
+| **Text Analyst** | LLM | Scores the borrower description, returns `text_risk_score` + `confidence` |
+| **Feature Strategist** | LLM | Proposes per-grade text weight, classifies signals (PERSISTENT_WIN / NOISY / etc.) using trajectory |
+| **Subgroup Advocate** | LLM | Vetoes weight changes that harm specific grades; flags positive opportunities |
+| **Green Agent** | LLM + ML | Hub agent: runs XGBoost baseline, evaluates fusion, generates expectations / reflects (Reflexion), arbitrates on veto, validates with adaptive thresholds, and trains the Tier-A learned gate |
+| **Reporter** | LLM | Generates the natural-language explanation per loan |
+
+The Arbitrator role is owned by **Green** (`green.arbitrate()` in the notebook; the *Green Agent — Arbitration (on-veto)* panel in the demo) — it is **not** a separate White Agent.
 
 ## Repository layout
 
