@@ -1,12 +1,19 @@
 # ── Data (large / regenerable) ────────────────────────────────────────────────
 loan_default.csv
+loan_default_sample*.csv
 data/*.csv
 *.parquet
+
+# ── Text-analyst outputs (large; regenerable from text_analyst.py) ────────────
+text_ana_results/
 
 # ── Secrets ───────────────────────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
+
+# ── Text analyst driver (kept local; contains user-specific API key) ──────────
+text_analyst.py
 
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
