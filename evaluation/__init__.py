@@ -6,8 +6,9 @@ All functions here operate on held-out test sets and produce offline reports
 or artifacts. They are NOT for runtime per-case use.
 
 Per-case (single-row) prediction, comparison, and explanation lives in
-`app/api/inference.py` and is served via the FastAPI backend to the
-Streamlit frontend.
+`app/ui/Home.py`, which loads the model artifact directly and calls the
+LLM agents inline. The two paths share the fusion formula by convention,
+not by code reuse — keep them in sync when changing the math.
 
 Five metric families, all MAS-specific:
 
@@ -18,7 +19,7 @@ Five metric families, all MAS-specific:
   3. ablation   — Is the MAS worth it? vs LR-stacking, vs brute-force grid search.
   4. trust      — Does the MAS know when NOT to trust the text? Confidence
                   reliability + selective-fusion curve.
-  5. report     — One-page consolidated report (Markdown / HTML).
+  5. report     — One-page consolidated Markdown report.
 """
 
 from .core import (

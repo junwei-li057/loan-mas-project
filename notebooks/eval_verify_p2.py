@@ -37,95 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import evaluation as ev  # noqa: E402
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. Reconstruct subset_test from sample1 artifacts (cell 12 logic)
-# ──────────────────────────────────────────────────────────────────────────────
-def build_subset(df_split: pd.DataFrame, text_pkl: Path, grade_norm_stats: dict) -> pd.DataFrame:
-    with open(text_pkl, "rb") as f:
-        results = pickle.load(f)
-    rdf = pd.DataFrame(results).set_index("idx")
-    if "text_risk_score" not in rdf.columns:
-        rdf["text_risk_score"] = rdf["risk_label"].astype(float)
-    sub = df_split.join(rdf[["text_risk_score", "confidence"]], how="left")
-    sub = sub.rename(columns={"confidence": "text_confidence"})
-    sub = sub.dropna(subset=["text_risk_score", "text_confidence"]).copy()
-
-    def _normalize(score, grade):
-        if grade not in grade_norm_stats:
-            return 0.5
-        m, s = grade_norm_stats[grade]
-        z = (score - m) / s
-        return round(min(max(0.5 + z * 0.15, 0.05), 0.95), 4)
-
-    sub["text_risk_score"] = sub.apply(
-        lambda r: _normalize(r["text_risk_score"], r["grade"]), axis=1
-    )
-    return sub
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. Synthetic decision_log for agent verification
-# ──────────────────────────────────────────────────────────────────────────────
-def synthesize_decision_log() -> tuple[list[dict], dict]:
-    """Build a 4-iter decision_log with mixed events, plus a final_result."""
-    log = [
-        {
-            "iteration": 0,
-            "event": "strategy_update",
-            "veto": False,
-            "advocate_mode": "rule",
-            "expectation": {"expected_delta_auc": 0.01},
-            "reflection": {"surprise": 0.03},
-            "overall_baseline": 0.72,
-            "overall_fused": 0.73,
-            "overall_baseline_auprc": 0.45,
-            "overall_fused_auprc": 0.47,
-            "advocate_opportunities": ["grade_C_underweighted"],
-        },
-        {
-            "iteration": 1,
-            "event": "green_arbitrate",
-            "veto": True,
-            "advocate_mode": "LLM",
-            "expectation": {"expected_delta_auc": 0.005},
-            "reflection": {"surprise": 0.08},
-            "overall_baseline": 0.72,
-            "overall_fused": 0.725,
-            "overall_baseline_auprc": 0.45,
-            "overall_fused_auprc": 0.46,
-            "advocate_opportunities": [],
-        },
-        {
-            "iteration": 2,
-            "event": "strategy_update",
-            "veto": False,
-            "advocate_mode": "rule",
-            "expectation": {"expected_delta_auc": 0.008},
-            "reflection": {"surprise": 0.02},
-            "overall_baseline": 0.72,
-            "overall_fused": 0.735,
-            "overall_baseline_auprc": 0.45,
-            "overall_fused_auprc": 0.48,
-            "advocate_opportunities": ["grade_D_boost"],
-        },
-        {
-            "iteration": 3,
-            "event": "converged",
-            "veto": False,
-            "advocate_mode": "rule",
-            "expectation": {"expected_delta_auc": 0.0005},
-            "reflection": {"surprise": 0.01},
-            "overall_baseline": 0.72,
-            "overall_fused": 0.735,
-            "overall_baseline_auprc": 0.45,
-            "overall_fused_auprc": 0.48,
-            "advocate_opportunities": [],
-        },
-    ]
-    final_result = {"overall_baseline_auprc": 0.45, "overall_fused_auprc": 0.48}
-    return log, final_result
+from evaluation._helpers import build_subset, synthesize_decision_log  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -206,7 +118,6 @@ def main() -> int:
     print(f"  event_counts         : {dyn['event_counts']}")
     print(f"  advocate_modes       : {dyn['advocate_modes']}")
     print(f"  arbitration_outcomes : {dyn['arbitration_outcomes']}")
-    print(f"  reflexion_quality    : {dyn['reflexion_quality']}")
     print(f"  per_iter_trace[0]    : {dyn['per_iter_trace'][0]}")
 
     print("\n" + "=" * 78)

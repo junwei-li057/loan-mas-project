@@ -10,10 +10,17 @@ statistically meaningful improvement over the numeric-only baseline?
 """
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+# Below this evaluation-set size, bootstrap CIs widen to the point where
+# pipeline differences cannot be meaningfully distinguished from noise. We
+# still compute the metrics, but warn so the caller and the report reader
+# do not over-interpret the numbers.
+_MIN_INFORMATIVE_N = 100
 from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
@@ -178,6 +185,13 @@ def pipeline_comparison(
             f"{list(preds_by_pipeline)}"
         )
     y = np.asarray(y_true).astype(int)
+    if len(y) < _MIN_INFORMATIVE_N:
+        warnings.warn(
+            f"pipeline_comparison: n={len(y)} is below the recommended minimum of "
+            f"{_MIN_INFORMATIVE_N}; bootstrap CIs and DeLong p-values will be wide "
+            f"and conclusions may not be statistically meaningful.",
+            stacklevel=2,
+        )
     p_ref = np.asarray(preds_by_pipeline[reference], dtype=float)
 
     rows = []

@@ -1,8 +1,7 @@
 """
 report.py — one-page consolidated evaluation report.
 
-Stitches together the five metric families into a single artifact (Markdown
-by default, optional HTML render).
+Stitches together the five metric families into a single Markdown artifact.
 
 Sections produced:
   1. Executive summary  : one-paragraph verdict + headline numbers
@@ -16,7 +15,6 @@ from __future__ import annotations
 
 import datetime as _dt
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -101,11 +99,10 @@ def generate_report(
     ablation_df: pd.DataFrame,
     trust_diag: dict,
     out_path: str | Path = "eval_report.md",
-    fmt: Literal["md", "html"] = "md",
     title: str = "Multi-Agent Loan-Default System — Evaluation Report",
     meta: dict | None = None,
 ) -> Path:
-    """Produce one consolidated evaluation report.
+    """Produce one consolidated Markdown evaluation report.
 
     Parameters
     ----------
@@ -115,7 +112,6 @@ def generate_report(
     ablation_df            : from `ablation_summary(...)`
     trust_diag             : from `trust_calibration(...)`
     out_path               : output path (overwritten)
-    fmt                    : 'md' or 'html'
     meta                   : optional dict for the report header
                              (e.g. {'model_version', 'data_window',
                               'evaluated_on', 'git_sha'})
@@ -124,9 +120,6 @@ def generate_report(
     -------
     Path to the written report.
     """
-    if fmt not in ("md", "html"):
-        raise ValueError(f"fmt must be 'md' or 'html'; got {fmt!r}")
-
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -179,15 +172,6 @@ def generate_report(
         f"- Event counts: `{loop_dyn.get('event_counts', {})}`  \n"
         f"- Arbitration outcomes: `{loop_dyn.get('arbitration_outcomes', {})}`  \n"
     )
-    rq = loop_dyn.get("reflexion_quality")
-    if rq is not None:
-        sec_loop += (
-            f"- Reflexion accuracy: mean |ΔAUC err| = "
-            f"**{_fmt(rq.get('mean_abs_delta_auc_err'), 4)}**, "
-            f"mean |mean_shift err| = "
-            f"**{_fmt(rq.get('mean_abs_mean_shift_err'), 4)}** "
-            f"(n={rq.get('n_records', '—')})\n"
-        )
     sec_loop += "\n### Per-iter trace\n\n" + trace_md
 
     sec_abl = (
@@ -224,27 +208,5 @@ def generate_report(
     )
 
     parts = [header, "", sec_exec, "", sec_pipe, "", sec_agent, "", sec_loop, "", sec_abl, "", sec_trust, ""]
-    md = "\n".join(parts)
-
-    if fmt == "md":
-        out.write_text(md, encoding="utf-8")
-    else:
-        try:
-            import markdown as _md_lib
-        except ImportError as e:
-            raise RuntimeError(
-                "fmt='html' requires `pip install markdown`; or set fmt='md'."
-            ) from e
-        html = _md_lib.markdown(md, extensions=["tables"])
-        out.write_text(
-            f"<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>"
-            "<style>body{font-family:-apple-system,Segoe UI,sans-serif;max-width:980px;"
-            "margin:2em auto;padding:0 1em;line-height:1.5}"
-            "table{border-collapse:collapse}"
-            "th,td{border:1px solid #ccc;padding:.35em .75em}"
-            "th{background:#f0f0f0;text-align:left}"
-            "code{background:#f6f6f6;padding:.1em .3em;border-radius:3px}"
-            "</style></head><body>" + html + "</body></html>",
-            encoding="utf-8",
-        )
+    out.write_text("\n".join(parts), encoding="utf-8")
     return out

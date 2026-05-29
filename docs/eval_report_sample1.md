@@ -1,9 +1,9 @@
 # Multi-Agent Loan-Default System — Evaluation Report
 
-_generated_: `2026-05-28T14:50:09`
+_generated_: `2026-05-28T20:26:38`
 _data_: `sample1 (train/test)`
 _model_artifact_: `models/loan_default_model.pkl`
-_decision_log_: `synthetic (4-iter)`
+_decision_log_: `synthetic (4-iter; no real log found)`
 
 ## 1. Executive Summary
 
@@ -58,8 +58,8 @@ Each row is an alternative method. `vs_baseline_*` columns are absolute differen
 | method | test_auc | test_auprc | vs_baseline_auc | vs_baseline_auprc | note |
 | --- | --- | --- | --- | --- | --- |
 | baseline-only | 0.6756 | 0.4334 | 0.0000 | 0.0000 | XGBoost on numeric features |
-| LR stacking | 0.5585 | 0.3318 | -0.1170 | -0.1016 | LogReg, 22 features |
-| Grid search (best) | 0.6652 | 0.4299 | -0.0104 | -0.0035 | 180-combo brute force |
+| LR stacking | 0.5348 | 0.3165 | -0.1407 | -0.1169 | LogReg, 22 features |
+| Grid search (best) | 0.6652 | 0.4299 | -0.0104 | -0.0035 | 1620-combo brute force |
 | MAS Strategist | 0.6726 | 0.4318 | -0.0030 | -0.0016 | Multi-agent LLM-tuned 5-scalar weights |
 
 ## 6. Trust Calibration

@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import evaluation as ev  # noqa: E402
-from notebooks.eval_verify_p2 import build_subset, synthesize_decision_log  # noqa: E402
+from evaluation._helpers import build_subset, synthesize_decision_log  # noqa: E402
 
 
 def main() -> int:
@@ -69,9 +69,25 @@ def main() -> int:
     )
     print(pipeline_cmp.to_string())
 
-    # 3. agent: KPI + loop_dynamics (synthetic decision_log)
-    print("\n[agent] per_agent_kpi + loop_dynamics on synthetic 4-iter log …")
-    syn_log, syn_final = synthesize_decision_log()
+    # 3. agent: KPI + loop_dynamics
+    # Prefer a real decision_log pickled by the training notebook (see README
+    # for the dump snippet). Fall back to a 4-iter synthetic log only when no
+    # real one is available; the report metadata records which one was used so
+    # readers know whether §3 / §4 reflect a real run or a stand-in.
+    decision_log_path = REPO_ROOT / "data" / "decision_log_sample1.pkl"
+    if decision_log_path.exists():
+        with open(decision_log_path, "rb") as f:
+            log_blob = pickle.load(f)
+        syn_log = log_blob["decision_log"]
+        syn_final = log_blob["final_result"]
+        decision_log_source = f"real ({len(syn_log)}-iter, from {decision_log_path.name})"
+        print(f"\n[agent] per_agent_kpi + loop_dynamics on REAL {len(syn_log)}-iter log "
+              f"({decision_log_path.name}) …")
+    else:
+        syn_log, syn_final = synthesize_decision_log()
+        decision_log_source = "synthetic (4-iter; no real log found)"
+        print(f"\n[agent] ⚠️  no real decision_log at {decision_log_path}; "
+              f"using synthetic 4-iter log …")
     agent_kpi = ev.per_agent_kpi(syn_log, syn_final)
     loop_dyn = ev.loop_dynamics(syn_log)
     print(agent_kpi.to_string())
@@ -91,6 +107,10 @@ def main() -> int:
         cands_c=[0.0, 0.05, 0.1, 0.2, 0.3],
         cands_d=[0.0, 0.05, 0.1, 0.15],
         cands_e=[0.0, 0.05, 0.1],
+        # Symmetric F / G coverage so grid search is not handicapped vs MAS,
+        # which can pick non-zero weights for any grade.
+        cands_f=[0.0, 0.05, 0.10],
+        cands_g=[0.0, 0.05, 0.10],
         cands_thr=[0.60, 0.65, 0.70],
     )
     print(f"  n_candidates={grid_res['n_candidates']}  "
@@ -128,11 +148,10 @@ def main() -> int:
         ablation_df=ablation,
         trust_diag=trust,
         out_path=out_path,
-        fmt="md",
         meta={
             "data": "sample1 (train/test)",
             "model_artifact": "models/loan_default_model.pkl",
-            "decision_log": "synthetic (4-iter)",
+            "decision_log": decision_log_source,
         },
     )
     print(f"  wrote {written}  ({written.stat().st_size} bytes)")

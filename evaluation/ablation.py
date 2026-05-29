@@ -135,8 +135,11 @@ _DEFAULT_GRID = {
     "C": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
     "D": [0.0, 0.05, 0.1, 0.15, 0.2],
     "E": [0.0, 0.05, 0.1],
-    "F": [0.0],
-    "G": [0.0],
+    # F/G previously locked to [0.0], which structurally handicapped grid search
+    # vs. the MAS Strategist (which can pick non-zero weights for every grade).
+    # Use a small symmetric grid so the comparison is fair.
+    "F": [0.0, 0.05, 0.10],
+    "G": [0.0, 0.05, 0.10],
     "thr": [0.55, 0.60, 0.65, 0.70, 0.75],
 }
 

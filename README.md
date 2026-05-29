@@ -103,6 +103,20 @@ python notebooks/eval_verify_p3.py    # rewrites docs/eval_report_sample1.md
 
 This drives the full `evaluation/` suite (pipeline comparison, per-agent KPI, ablation, trust calibration) on the saved sample-1 artifacts and writes a consolidated Markdown report.
 
+### Producing a real `decision_log` (optional but recommended)
+
+`per_agent_kpi` and `loop_dynamics` (sections §3 and §4 of the report) consume a `decision_log` from the iterative training loop. If `data/decision_log_sample1.pkl` exists, `eval_verify_p3.py` loads it; otherwise it falls back to a 4-iter synthetic log and labels the report header accordingly. To dump a real one, add this cell at the end of the training notebook right after `run_iterative_loop` returns:
+
+```python
+import pickle
+from pathlib import Path
+
+with open(Path("data/decision_log_sample1.pkl"), "wb") as f:
+    pickle.dump({"decision_log": decision_log, "final_result": final_result}, f)
+```
+
+The pickle is small (one dict of per-iter records); commit it if you want the published report to reflect a real run.
+
 ## Implementation notes
 
 Three conventions are load-bearing for stable behavior with the MiniMax-M2.7 backend; preserve them when extending the system.

@@ -16,8 +16,6 @@ the notebook).
 """
 from __future__ import annotations
 
-from typing import Any
-
 import pandas as pd
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -45,10 +43,14 @@ PER_ITER_MILESTONES: list[dict] = [
         "name": "M_strategy_proposed",
         "description": "Strategist produced a non-trivial proposal (won or vetoed)",
         "agents": ["Strategist"],
+        # `green_llm:*` is Green's standalone fusion decision — not a Strategist
+        # action — so it must not credit the Strategist. `strategy_update` =
+        # proposal accepted; `fallback` = Strategist LLM failed and rule path
+        # ran; `green_arbitrate*` = proposal vetoed and routed to Green's
+        # arbitration. All three are Strategist work.
         "check": lambda e: (
             e.get("event") in ("strategy_update", "fallback")
             or str(e.get("event", "")).startswith("green_arbitrate")
-            or str(e.get("event", "")).startswith("green_llm:")
         ),
     },
     {
@@ -64,8 +66,13 @@ PER_ITER_MILESTONES: list[dict] = [
         "check": lambda e: bool(e.get("advocate_opportunities", [])),
     },
     {
-        "name": "M_arbitration_succeeded",
-        "description": "On veto, Green's arbitrate resolved without LLM safety net",
+        # Renamed from M_arbitration_succeeded — the original docstring claimed
+        # this counted arbitrations that resolved without the LLM safety net,
+        # but the check has no way to detect "rule path vs. LLM fallback" from
+        # the decision_log shape. Treating any invoked arbitration as a hit
+        # keeps the docstring and the implementation honest.
+        "name": "M_arbitration_invoked",
+        "description": "On veto, Green's arbitrate was invoked (rule path or LLM safety net)",
         "agents": ["Green", "Strategist", "Advocate"],
         "check": lambda e: (
             e.get("veto", False)
@@ -202,18 +209,12 @@ def per_agent_kpi(
     return df
 
 
-def loop_dynamics(
-    decision_log: list[dict],
-    green: Any | None = None,
-) -> dict:
+def loop_dynamics(decision_log: list[dict]) -> dict:
     """Loop-level diagnostics extracted from decision_log.
 
     Parameters
     ----------
     decision_log : the per-iter log produced by run_iterative_loop.
-    green        : optional. If provided and has a `.experience` attribute,
-                   Reflexion accuracy is reported. Otherwise reflexion_quality
-                   is None.
 
     Returns
     -------
@@ -226,8 +227,6 @@ def loop_dynamics(
                                   green_arbitrate, fallback, converged, ...)
         arbitration_outcomes    : on-veto event distribution
         per_iter_trace          : list of compact per-iter rows for tabular display
-        reflexion_quality       : {mean_abs_delta_auc_err, mean_abs_mean_shift_err}
-                                  or None if `green.experience` is unavailable
     """
     n_iters = len(decision_log)
     converged = any(e.get("event") == "converged" for e in decision_log)
@@ -270,18 +269,6 @@ def loop_dynamics(
             }
         )
 
-    reflexion_quality: dict | None = None
-    if green is not None and hasattr(green, "experience"):
-        exp = list(getattr(green, "experience"))
-        if exp:
-            errs_d = [abs(r.get("errors", {}).get("err_delta_auc", 0.0)) for r in exp]
-            errs_s = [abs(r.get("errors", {}).get("err_mean_shift", 0.0)) for r in exp]
-            reflexion_quality = {
-                "n_records": len(exp),
-                "mean_abs_delta_auc_err": float(sum(errs_d) / len(errs_d)),
-                "mean_abs_mean_shift_err": float(sum(errs_s) / len(errs_s)),
-            }
-
     return {
         "n_iters": n_iters,
         "converged": converged,
@@ -290,5 +277,4 @@ def loop_dynamics(
         "event_counts": event_counts,
         "arbitration_outcomes": arbitration_outcomes,
         "per_iter_trace": per_iter_trace,
-        "reflexion_quality": reflexion_quality,
     }
