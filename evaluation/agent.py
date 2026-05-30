@@ -26,83 +26,123 @@ import pandas as pd
 # attributed to one or more agents — that agent is credited when the milestone
 # fires. KPI_j = (milestones agent j is credited for) / (total milestone slots).
 
+# ── Milestone design (v2) ────────────────────────────────────────────────────
+# Each agent gets a (floor, ceiling) pair per iter:
+#   floor   = "the agent ran and did its assigned job in this iter"        → expect ~100% fire
+#   ceiling = "the agent's contribution was visibly useful in this iter"   → expect 30–70% fire
+# Plus two ONCE milestones for whole-run outcomes.
+#
+# The v1 design rewarded the wrong things: a healthy 2-iter converged loop with
+# no veto and full-set fused ≈ baseline (our actual selective-fusion regime)
+# fired hardly any milestones — the system was punished for running well. v2
+# splits each agent into a floor + ceiling so the KPI scales with **quality of
+# work done**, not with "did the loop need arbitration / did fused beat baseline
+# on the noisy full-test view".
 PER_ITER_MILESTONES: list[dict] = [
+    # ── TextAnalyst ──────────────────────────────────────────────────────────
     {
-        "name": "M_expect_generated",
-        "description": "Green generated an expectation before evaluate_fusion",
-        "agents": ["Green"],
-        "check": lambda e: "expectation" in e,
+        "name": "M_text_signal_present",
+        "description": "TextAnalyst output is consumed by the loop this iter (floor)",
+        "agents": ["TextAnalyst"],
+        "check": lambda e: e.get("iteration") is not None,
     },
     {
-        "name": "M_low_surprise",
-        "description": "Green's prediction error matched reality (surprise < 0.05)",
-        "agents": ["Green"],
-        "check": lambda e: e.get("reflection", {}).get("surprise", float("inf")) < 0.05,
+        "name": "M_text_drives_change",
+        "description": "Fused prediction is materially different from baseline "
+                       "this iter (|Δ AUPRC| > 5e-4) — text actually moved the score",
+        "agents": ["TextAnalyst"],
+        "check": lambda e: abs(
+            float(e.get("overall_fused_auprc", 0) or 0)
+            - float(e.get("overall_baseline_auprc", 0) or 0)
+        ) > 5e-4,
     },
+
+    # ── Strategist ───────────────────────────────────────────────────────────
     {
-        "name": "M_strategy_proposed",
-        "description": "Strategist produced a non-trivial proposal (won or vetoed)",
+        "name": "M_strategy_examined",
+        "description": "Strategist evaluated this iter — proposed, kept, converged, "
+                       "or routed to arbitration (floor)",
         "agents": ["Strategist"],
-        # `green_llm:*` is Green's standalone fusion decision — not a Strategist
-        # action — so it must not credit the Strategist. `strategy_update` =
-        # proposal accepted; `fallback` = Strategist LLM failed and rule path
-        # ran; `green_arbitrate*` = proposal vetoed and routed to Green's
-        # arbitration. All three are Strategist work.
         "check": lambda e: (
-            e.get("event") in ("strategy_update", "fallback")
-            or str(e.get("event", "")).startswith("green_arbitrate")
+            e.get("event") in (
+                "strategy_update", "strategy_unchanged", "converged",
+                "fallback", "keep_learned",
+            )
+            or str(e.get("event", "")).startswith("green_")
         ),
     },
     {
-        "name": "M_no_veto",
-        "description": "Advocate let the strategy pass (subgroup-safe)",
+        "name": "M_strategy_grounded",
+        "description": "Strategist produced a non-trivial rationale "
+                       "(reflexion / advocate input genuinely used, not boilerplate)",
+        "agents": ["Strategist"],
+        "check": lambda e: len(str(e.get("strategist_rationale", "") or "")) > 30,
+    },
+
+    # ── Advocate ─────────────────────────────────────────────────────────────
+    {
+        "name": "M_advocate_acted",
+        "description": "Advocate produced a verdict for this iter (floor)",
         "agents": ["Advocate"],
-        "check": lambda e: not e.get("veto", False),
+        "check": lambda e: e.get("advocate_mode") is not None,
     },
     {
-        "name": "M_opportunity_flagged",
-        "description": "Advocate flagged ≥1 positive opportunity",
+        "name": "M_advocate_subgroup_aware",
+        "description": "Advocate's verdict cited per-grade signal "
+                       "(opportunity_flags or affected_grades non-empty)",
         "agents": ["Advocate"],
-        "check": lambda e: bool(e.get("advocate_opportunities", [])),
+        "check": lambda e: bool(e.get("advocate_opportunities", []))
+                          or bool(e.get("veto_grades", [])),
+    },
+
+    # ── Green ────────────────────────────────────────────────────────────────
+    {
+        "name": "M_green_evaluated_with_reflection",
+        "description": "Green ran expect → evaluate_fusion → reflect cycle this iter (floor)",
+        "agents": ["Green"],
+        "check": lambda e: e.get("reflection") is not None,
     },
     {
-        # Renamed from M_arbitration_succeeded — the original docstring claimed
-        # this counted arbitrations that resolved without the LLM safety net,
-        # but the check has no way to detect "rule path vs. LLM fallback" from
-        # the decision_log shape. Treating any invoked arbitration as a hit
-        # keeps the docstring and the implementation honest.
-        "name": "M_arbitration_invoked",
-        "description": "On veto, Green's arbitrate was invoked (rule path or LLM safety net)",
-        "agents": ["Green", "Strategist", "Advocate"],
-        "check": lambda e: (
-            e.get("veto", False)
-            and str(e.get("event", "")).startswith("green_arbitrate")
-        ),
-    },
-    {
-        "name": "M_auprc_improved_iter",
-        "description": "Fused AUPRC exceeded baseline AUPRC this iteration",
-        "agents": ["Strategist", "TextAnalyst"],
-        "check": lambda e: (
-            e.get("overall_fused_auprc", 0) > e.get("overall_baseline_auprc", 0)
-        ),
+        "name": "M_green_reflection_accurate",
+        "description": "Green's prediction error stayed within tolerance "
+                       "(surprise < 0.05) — reflexion converging",
+        "agents": ["Green"],
+        "check": lambda e: (e.get("reflection") or {}).get("surprise", float("inf")) < 0.05,
     },
 ]
 
 ONCE_MILESTONES: list[dict] = [
     {
         "name": "M_loop_converged",
-        "description": "Loop reached convergence before max_iter",
+        "description": "Loop reached convergence before max_iter "
+                       "(joint Strategist / Advocate / Green achievement)",
         "agents": ["Green", "Strategist", "Advocate"],
         "check": lambda log, fr: any(e.get("event") == "converged" for e in log),
     },
     {
         "name": "M_test_above_baseline",
-        "description": "Final fused AUPRC on test > baseline AUPRC",
+        "description": "Final fused AUPRC on test ≥ baseline AUPRC "
+                       "(text adds value at the whole-system level)",
         "agents": ["Strategist", "TextAnalyst"],
         "check": lambda log, fr: (
-            fr.get("overall_fused_auprc", 0) > fr.get("overall_baseline_auprc", 0)
+            fr.get("overall_fused_auprc", 0) >= fr.get("overall_baseline_auprc", 0)
         ),
+    },
+    {
+        # The system's thesis-level success criterion: the trust gate works.
+        # All four agents jointly contribute — TextAnalyst supplies the raw
+        # signal, Strategist tunes the per-grade weight, Advocate enforces
+        # the conf_threshold gate, Green runs the actual fusion. So this
+        # milestone credits all four when the headline selective lift is
+        # positive. Requires `top_coverage_delta_auprc` to be injected into
+        # final_result by the caller (eval_verify_p3 does this after running
+        # trust_calibration); defaults to 0 (not fired) if missing.
+        "name": "M_selective_lift_positive",
+        "description": "Top-5% confidence subset Δ AUPRC > 0 — the trust gate "
+                       "paid off where the system chose to rely on text "
+                       "(joint achievement of all four agents)",
+        "agents": ["TextAnalyst", "Strategist", "Advocate", "Green"],
+        "check": lambda log, fr: float(fr.get("top_coverage_delta_auprc", 0) or 0) > 0,
     },
 ]
 

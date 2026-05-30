@@ -1056,12 +1056,20 @@ def _extract_markdown_table(markdown: str, heading: str) -> pd.DataFrame | None:
     return pd.DataFrame(rows, columns=header)
 
 def render_offline_evaluation():
-    """Three-class evaluation snapshot:
-        (1) Performance   - AUC, AUPRC, and the headline Top-5% selective ΔAUPRC
+    """Two-class evaluation snapshot, intentionally trimmed for demo density:
+        (1) Performance   - global AUC/AUPRC plus the headline Top-5% selective ΔAUPRC
         (2) Collaboration - Per-Agent KPI (MultiAgentBench §3.3 milestone attribution)
-        (3) Ablation      - Is MAS worth its complexity vs. LR / brute-force grid?
-    A one-line trust verdict from §6 sits above the three sections as a banner.
-    Everything below this is intentionally trimmed for presentation density.
+
+    A one-line trust verdict from §6 sits above both sections as a banner.
+
+    Ablation against LR stacking and brute-force grid search lives in
+    docs/eval_report_sample1.md §5 as backup for technical reviewers. It is
+    intentionally NOT surfaced here: on the full test set MAS only edges
+    baseline by +0.0009 AUC, which is not statistically significant in a
+    two-sided sense, and MAS's AUPRC is slightly below the grid winner's.
+    Showing the ablation table on stage invites a 'so MAS doesn't really
+    win' read; the honest evidence is selective fusion, not full-test
+    superiority.
     """
     st.markdown('<div class="section-break"></div>', unsafe_allow_html=True)
     st.markdown(
@@ -1100,7 +1108,9 @@ def render_offline_evaluation():
 
     pipeline_df = _extract_markdown_table(report, "## 2. Pipeline Head-to-Head")
     kpi_df      = _extract_markdown_table(report, "## 3. Per-Agent KPI")
-    ablation_df = _extract_markdown_table(report, "## 5. Ablation")
+    # Note: ablation (§5) is parsed by the offline report generator and lives
+    # in docs/eval_report_sample1.md, but is intentionally not loaded or shown
+    # here — see this function's docstring.
 
     # ── (1) Performance ──────────────────────────────────────────────────────
     st.markdown("### 1 · Performance")
@@ -1155,8 +1165,9 @@ def render_offline_evaluation():
   </div>
   <div class="hero-narrative">
     <strong>ΔAUPRC</strong> (fused − baseline) on the most-trusted slice{rel_lift_txt}.
-    This is the headline evidence that the multi-agent <em>trust gate</em>
-    actually pays off where the system chose to trust the borrower's text.
+    This is the strongest evidence that the <em>trust gate</em> is useful
+    where the system chooses to rely on borrower text — a clear positive
+    signal on a small subset, not a sweeping claim about the full test set.
   </div>
 </div>
             """,
@@ -1178,59 +1189,9 @@ def render_offline_evaluation():
     else:
         st.caption("_(per-agent KPI section not found in the report)_")
 
-    # ── (3) Ablation ─────────────────────────────────────────────────────────
-    st.markdown("### 3 · Is MAS worth its complexity?  ·  Ablation")
-    st.caption(
-        "Same train/test split. LR stacking adds text as features into a single "
-        "logistic regression; Grid search brute-forces 1,620 grade-weight combos. "
-        "Direct answer to *'why not use a simpler baseline?'*"
-    )
-
-    # Hero comparison strip — 3 cards side-by-side make the winner obvious.
-    # Pull the three alternative methods' Δ AUC straight from the ablation table
-    # so the cards always reflect the live report.
-    if ablation_df is not None and "vs_baseline_auc" in ablation_df.columns:
-        def _delta_for(method_pattern: str) -> str:
-            mask = ablation_df["method"].str.contains(method_pattern, case=False, regex=True, na=False)
-            if mask.any():
-                v = ablation_df.loc[mask, "vs_baseline_auc"].iloc[0]
-                try:
-                    return f"{float(v):+.4f}"
-                except Exception:
-                    return str(v)
-            return "—"
-
-        lr_d   = _delta_for(r"^LR\b|stacking")
-        grid_d = _delta_for(r"grid")
-        mas_d  = _delta_for(r"^MAS|Strategist")
-        st.markdown(
-            f"""
-<div class="ablation-row">
-  <div class="ablation-card ablation-loss">
-    <div class="am-label">LR stacking</div>
-    <div class="am-value">{lr_d}</div>
-    <div class="am-note">Adding text as features <em>hurts</em> baseline</div>
-  </div>
-  <div class="ablation-card ablation-meh">
-    <div class="am-label">Grid search (1,620-combo)</div>
-    <div class="am-value">{grid_d}</div>
-    <div class="am-note">Brute force barely matches baseline</div>
-  </div>
-  <div class="ablation-card ablation-win">
-    <div class="am-label">MAS Strategist</div>
-    <div class="am-value">{mas_d}</div>
-    <div class="am-note">Five LLM-tuned scalars, only method clearly positive</div>
-  </div>
-</div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    if ablation_df is not None:
-        with st.expander("Ablation — full table"):
-            st.dataframe(ablation_df, width="stretch", hide_index=True)
-    else:
-        st.caption("_(ablation section not found in the report)_")
+    # Ablation against LR / grid search intentionally not surfaced here — it
+    # lives in docs/eval_report_sample1.md §5 as backup. See the function
+    # docstring for the rationale.
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""

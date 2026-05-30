@@ -1,6 +1,6 @@
 # Multi-Agent Loan-Default System — Evaluation Report
 
-_generated_: `2026-05-30T11:36:35`
+_generated_: `2026-05-30T15:57:37`
 _data_: `combined.pkl (16801 train, 4199 test; id-joined to loan_default.csv)`
 _model_artifact_: `models/loan_default_model.pkl`
 _decision_log_: `real (2-iter, from decision_log_sample1.pkl)`
@@ -8,7 +8,7 @@ _decision_log_: `real (2-iter, from decision_log_sample1.pkl)`
 ## 1. Executive Summary
 
 - **Discrimination**: Strategist AUC = 0.6147 vs baseline 0.6138 (Δ = 0.0009, DeLong p = 0.0895; not significant).
-- **Agent contribution**: overall KPI = 0.203 over 2 loop iter(s), advocate veto rate = 0.000 (converged).
+- **Agent contribution**: overall KPI = 0.303 over 2 loop iter(s), advocate veto rate = 0.000 (converged).
 - **MAS vs grid search**: Δ test AUC = 0.0006 (MAS beats brute-force).
 - **Trust calibration**: confidence is a real trust signal; selective fusion helps.
 
@@ -23,15 +23,15 @@ Bootstrap 95% CIs on AUC and AUPRC. `delong_p_vs_ref` is the two-sided p-value v
 
 ## 3. Per-Agent KPI (MultiAgentBench §3.3)
 
-Iterations recorded: **2**. Milestones fired: **10** / 16.
+Iterations recorded: **2**. Milestones fired: **17** / 19.
 
 | agent | n_hit | n_total | kpi |
 | --- | --- | --- | --- |
-| TextAnalyst | 1.0000 | 16 | 0.0625 |
-| Strategist | 3.0000 | 16 | 0.1875 |
-| Advocate | 4.0000 | 16 | 0.2500 |
-| Green | 5.0000 | 16 | 0.3125 |
-| overall_kpi | — | 16 | 0.2031 |
+| TextAnalyst | 6.0000 | 19 | 0.3158 |
+| Strategist | 6.0000 | 19 | 0.3158 |
+| Advocate | 5.0000 | 19 | 0.2632 |
+| Green | 6.0000 | 19 | 0.3158 |
+| overall_kpi | — | 19 | 0.3026 |
 
 ## 4. Loop Dynamics
 

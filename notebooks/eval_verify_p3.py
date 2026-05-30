@@ -137,6 +137,19 @@ def main() -> int:
     print(f"  slope       : {trust['slope']:.4f}")
     print(f"  top ΔAUPRC  : {trust['top_delta_auprc']:+.4f}")
     print(f"  reliability bins : {len(trust['reliability'])}")
+
+    # Inject the top-5% selective lift into final_result so that
+    # M_selective_lift_positive (ONCE milestone in evaluation/agent.py) has
+    # what it needs. Default to 0 if the selective curve is empty, which
+    # makes the milestone simply not fire — same as before this field existed.
+    sel = trust.get("selective")
+    if hasattr(sel, "iloc") and len(sel) > 0:
+        syn_final["top_coverage_delta_auprc"] = float(sel.iloc[0]["delta_auprc"])
+        # Recompute Per-Agent KPI now that final_result carries the new field
+        # (the agent_kpi computed earlier still used the unaugmented dict).
+        agent_kpi = ev.per_agent_kpi(syn_log, syn_final)
+        print(f"\n[agent] re-computed KPI after injecting top_coverage_delta_auprc:")
+        print(agent_kpi.to_string())
     print(f"  selective points : {len(trust['selective'])}")
 
     # 6. report: generate the consolidated MD
