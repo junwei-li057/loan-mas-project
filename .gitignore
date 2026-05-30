@@ -5,7 +5,11 @@ data/*.csv
 *.parquet
 
 # ── Text-analyst outputs (large; regenerable from text_analyst.py) ────────────
-text_ana_results/
+# Ignore everything under text_ana_results/ EXCEPT the consolidated 21000-borrower
+# pkl we publish. The bare-directory form `text_ana_results/` would block negations
+# below it; using `text_ana_results/*` keeps the exception working.
+text_ana_results/*
+!text_ana_results/text_analysis_combined.pkl
 
 # ── Secrets ───────────────────────────────────────────────────────────────────
 .env
