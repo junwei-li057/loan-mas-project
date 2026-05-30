@@ -19,7 +19,7 @@ already cloud-ready; no code changes are required.
 2. Fill in:
    - **Repository**: `junwei-li057/loan-mas-project`
    - **Branch**: `main`
-   - **Main file path**: `app/loan_demo.py`
+   - **Main file path**: `app/ui/Home.py`
    - **Python version** (Advanced settings): `3.11`
 3. Open **Advanced settings → Secrets** and paste:
    ```toml
@@ -57,12 +57,15 @@ These files must stay in `main`:
 
 | Path | Purpose |
 |---|---|
-| `app/loan_demo.py` | Streamlit entry point (runpy shim) |
-| `app/ui/Home.py` | The actual single-page app |
+| `app/ui/Home.py` | The single-page app — Streamlit Cloud entry point |
 | `models/loan_default_model.pkl` | Loaded at startup; required |
 | `docs/eval_report_sample1.md` | Rendered by the "Offline evaluation" panel |
 | `.streamlit/config.toml` | Pins theme to light (matches Home.py CSS) |
 | `requirements.txt` | Pip dependencies installed by the cloud runner |
+
+(`app/loan_demo.py` is a `runpy` wrapper that re-runs `Home.py` so the legacy
+local command `streamlit run app/loan_demo.py` keeps working; it is not used
+by the cloud deployment.)
 
 Files that are NOT needed at runtime (kept out of the cloud image by
 `.gitignore`): `loan_default.csv`, `text_analyst.py`, `text_ana_results/`
