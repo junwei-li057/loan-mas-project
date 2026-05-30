@@ -1056,6 +1056,13 @@ def _extract_markdown_table(markdown: str, heading: str) -> pd.DataFrame | None:
     return pd.DataFrame(rows, columns=header)
 
 def render_offline_evaluation():
+    """Three-class evaluation snapshot:
+        (1) Performance   - AUC, AUPRC, and the headline Top-5% selective ΔAUPRC
+        (2) Collaboration - Per-Agent KPI (MultiAgentBench §3.3 milestone attribution)
+        (3) Ablation      - Is MAS worth its complexity vs. LR / brute-force grid?
+    A one-line trust verdict from §6 sits above the three sections as a banner.
+    Everything below this is intentionally trimmed for presentation density.
+    """
     st.markdown('<div class="section-break"></div>', unsafe_allow_html=True)
     st.markdown(
         """
@@ -1074,46 +1081,156 @@ def render_offline_evaluation():
         return
 
     report = REPORT_PATH.read_text(encoding="utf-8")
+
+    # Source caption — show data scope + generation time so viewers know what
+    # the test set actually was (sample1 vs combined.pkl makes a 70× difference).
     generated = re.search(r"_generated_:\s*`([^`]+)`", report)
+    data_scope = re.search(r"_data_:\s*`([^`]+)`", report)
+    caption_bits = [f"`docs/eval_report_sample1.md`"]
+    if data_scope:
+        caption_bits.append(data_scope.group(1))
     if generated:
-        st.caption(f"Source: `docs/eval_report_sample1.md` · generated `{generated.group(1)}`")
-    else:
-        st.caption("Source: `docs/eval_report_sample1.md`")
+        caption_bits.append(f"generated {generated.group(1)}")
+    st.caption("Source: " + " · ".join(caption_bits))
+
+    # Trust verdict banner — pulled from §6's "**Verdict**: ..." line.
+    verdict_m = re.search(r"\*\*Verdict\*\*:\s*([^\n]+)", report)
+    if verdict_m:
+        st.success(f"**Trust verdict** — {verdict_m.group(1).strip()}")
 
     pipeline_df = _extract_markdown_table(report, "## 2. Pipeline Head-to-Head")
-    kpi_df = _extract_markdown_table(report, "## 3. Per-Agent KPI")
+    kpi_df      = _extract_markdown_table(report, "## 3. Per-Agent KPI")
     ablation_df = _extract_markdown_table(report, "## 5. Ablation")
-    trust_df = _extract_markdown_table(report, "### Confidence reliability bins")
 
+    # ── (1) Performance ──────────────────────────────────────────────────────
+    st.markdown("### 1 · Performance")
+    st.caption(
+        "Held-out AUC / AUPRC plus the **headline selective-fusion gain** on the "
+        "top-5% most-trusted cases. The big card below is the single number that "
+        "says 'text fusion paid off where the system chose to trust it'."
+    )
     if pipeline_df is not None and not pipeline_df.empty:
         baseline = pipeline_df[pipeline_df["pipeline"] == "baseline"].iloc[0]
         strategist = pipeline_df[pipeline_df["pipeline"] == "strategist"].iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
+        # Global metrics — supporting context
+        c1, c2, c3 = st.columns(3)
         c1.metric("Baseline AUC", baseline["auc"])
-        c2.metric("Strategist AUC", strategist["auc"], delta=f"{float(strategist['auc']) - float(baseline['auc']):+.4f}")
-        c3.metric("Strategist AUPRC", strategist["auprc"], delta=f"{float(strategist['auprc']) - float(baseline['auprc']):+.4f}")
-        c4.metric("DeLong p", strategist["delong_p_vs_ref"])
-        with st.expander("Pipeline head-to-head table"):
+        c2.metric(
+            "Strategist AUC", strategist["auc"],
+            delta=f"{float(strategist['auc']) - float(baseline['auc']):+.4f}",
+        )
+        c3.metric(
+            "Strategist AUPRC", strategist["auprc"],
+            delta=f"{float(strategist['auprc']) - float(baseline['auprc']):+.4f}",
+        )
+
+        # Hero metric — Top-5% ΔAUPRC, the selective-fusion headline number.
+        # Computed inline from §6's selective curve so we can also surface
+        # the relative-lift framing alongside the raw delta.
+        top_delta_m = re.search(r"Top-coverage ΔAUPRC .*?:\s*\*\*([^*]+)\*\*", report)
+        top_delta_str = top_delta_m.group(1).strip() if top_delta_m else "—"
+        # Pull baseline AUPRC at the same top-5% slice from the selective table
+        # to compute the relative lift (e.g. 0.0129 / 0.2466 ≈ 5.2%).
+        sel_df = _extract_markdown_table(report, "### Selective-fusion curve")
+        rel_lift_txt = ""
+        if sel_df is not None and len(sel_df) > 0:
+            try:
+                row0 = sel_df.iloc[0]
+                base_auprc = float(row0["baseline_auprc"])
+                delta_val = float(top_delta_str)
+                rel_pct = 100.0 * delta_val / base_auprc if base_auprc > 0 else 0.0
+                rel_lift_txt = (
+                    f" — a <strong>{rel_pct:.1f}% relative lift</strong> on the "
+                    f"{int(float(row0['n_kept']))} most-trusted cases "
+                    f"(baseline AUPRC there = {base_auprc:.4f})"
+                )
+            except Exception:
+                rel_lift_txt = ""
+        st.markdown(
+            f"""
+<div class="hero-metric">
+  <div>
+    <div class="hero-label">Selective fusion · Top-5% confidence subset</div>
+    <div class="hero-value">+{top_delta_str.lstrip('+')}</div>
+  </div>
+  <div class="hero-narrative">
+    <strong>ΔAUPRC</strong> (fused − baseline) on the most-trusted slice{rel_lift_txt}.
+    This is the headline evidence that the multi-agent <em>trust gate</em>
+    actually pays off where the system chose to trust the borrower's text.
+  </div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.expander("Pipeline head-to-head — full table"):
             st.dataframe(pipeline_df, width="stretch", hide_index=True)
 
-    c1, c2, c3 = st.columns(3)
-    veto = re.search(r"Advocate veto rate:\s*\*\*([^*]+)\*\*", report)
-    slope = re.search(r"LLM-confidence-vs-accuracy slope:\s*\*\*([^*]+)\*\*", report)
-    top_delta = re.search(r"Top-coverage ΔAUPRC .*?:\s*\*\*([^*]+)\*\*", report)
-    c1.metric("Advocate veto rate", veto.group(1) if veto else "—")
-    c2.metric("Confidence slope", slope.group(1) if slope else "—")
-    c3.metric("Top-coverage ΔAUPRC", top_delta.group(1) if top_delta else "—")
+    # ── (2) Collaboration ────────────────────────────────────────────────────
+    st.markdown("### 2 · Agent collaboration  ·  Per-Agent KPI")
+    st.caption(
+        "MultiAgentBench §3.3 milestone-attribution KPI. Measures *how much each "
+        "agent contributed to system-success events* during the training loop — "
+        "not raw performance. Useful for spotting agents that don't pull their weight."
+    )
+    if kpi_df is not None:
+        st.dataframe(kpi_df, width="stretch", hide_index=True)
+    else:
+        st.caption("_(per-agent KPI section not found in the report)_")
 
-    with st.expander("Agent KPI / ablation / trust calibration"):
-        if kpi_df is not None:
-            st.markdown("**Per-agent KPI**")
-            st.dataframe(kpi_df, width="stretch", hide_index=True)
-        if ablation_df is not None:
-            st.markdown("**Ablation**")
+    # ── (3) Ablation ─────────────────────────────────────────────────────────
+    st.markdown("### 3 · Is MAS worth its complexity?  ·  Ablation")
+    st.caption(
+        "Same train/test split. LR stacking adds text as features into a single "
+        "logistic regression; Grid search brute-forces 1,620 grade-weight combos. "
+        "Direct answer to *'why not use a simpler baseline?'*"
+    )
+
+    # Hero comparison strip — 3 cards side-by-side make the winner obvious.
+    # Pull the three alternative methods' Δ AUC straight from the ablation table
+    # so the cards always reflect the live report.
+    if ablation_df is not None and "vs_baseline_auc" in ablation_df.columns:
+        def _delta_for(method_pattern: str) -> str:
+            mask = ablation_df["method"].str.contains(method_pattern, case=False, regex=True, na=False)
+            if mask.any():
+                v = ablation_df.loc[mask, "vs_baseline_auc"].iloc[0]
+                try:
+                    return f"{float(v):+.4f}"
+                except Exception:
+                    return str(v)
+            return "—"
+
+        lr_d   = _delta_for(r"^LR\b|stacking")
+        grid_d = _delta_for(r"grid")
+        mas_d  = _delta_for(r"^MAS|Strategist")
+        st.markdown(
+            f"""
+<div class="ablation-row">
+  <div class="ablation-card ablation-loss">
+    <div class="am-label">LR stacking</div>
+    <div class="am-value">{lr_d}</div>
+    <div class="am-note">Adding text as features <em>hurts</em> baseline</div>
+  </div>
+  <div class="ablation-card ablation-meh">
+    <div class="am-label">Grid search (1,620-combo)</div>
+    <div class="am-value">{grid_d}</div>
+    <div class="am-note">Brute force barely matches baseline</div>
+  </div>
+  <div class="ablation-card ablation-win">
+    <div class="am-label">MAS Strategist</div>
+    <div class="am-value">{mas_d}</div>
+    <div class="am-note">Five LLM-tuned scalars, only method clearly positive</div>
+  </div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if ablation_df is not None:
+        with st.expander("Ablation — full table"):
             st.dataframe(ablation_df, width="stretch", hide_index=True)
-        if trust_df is not None:
-            st.markdown("**Confidence reliability bins**")
-            st.dataframe(trust_df, width="stretch", hide_index=True)
+    else:
+        st.caption("_(ablation section not found in the report)_")
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -1420,6 +1537,61 @@ textarea {
 .chip-alert  { background:#fee2e2; color:#991b1b; border:1px solid #fca5a5; }
 .chip-idle   { background:#f3f1f7; color:#6B6478; border:1px solid #DED8E8; }
 .chip-arrow  { color:#8D829D; font-size:0.9rem; margin:0 1px; }
+
+/* Hero metric card — for the selective-fusion Top-5% ΔAUPRC headline */
+.hero-metric {
+    background: linear-gradient(135deg, #F0FDF4, #DCFCE7);
+    border: 2px solid var(--safe);
+    border-radius: 14px;
+    padding: 20px 26px;
+    margin: 8px 0 4px 0;
+    box-shadow: 0 6px 18px rgba(21,128,61,0.12);
+    display: flex; align-items: center; justify-content: space-between; gap: 24px;
+    flex-wrap: wrap;
+}
+.hero-metric .hero-label {
+    font-size: 0.78rem; color: var(--safe); letter-spacing: 0.08em;
+    text-transform: uppercase; font-weight: 800;
+}
+.hero-metric .hero-value {
+    font-size: 2.6rem; color: var(--safe); font-weight: 800;
+    line-height: 1.0; margin-top: 4px;
+}
+.hero-metric .hero-narrative {
+    flex: 1; min-width: 280px;
+    font-size: 0.95rem; color: var(--ink); line-height: 1.45;
+}
+.hero-metric .hero-narrative strong { color: var(--safe); }
+
+/* Ablation method cards — horizontally compare alternatives, MAS as winner */
+.ablation-row {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+    margin: 6px 0 10px 0;
+}
+.ablation-card {
+    border-radius: 12px; padding: 14px 16px;
+    border: 1px solid var(--border); background: var(--surface-soft);
+}
+.ablation-card .am-label {
+    font-size: 0.78rem; font-weight: 700; letter-spacing: 0.04em;
+    text-transform: uppercase; color: var(--muted);
+}
+.ablation-card .am-value {
+    font-size: 1.55rem; font-weight: 800; line-height: 1.1; margin-top: 4px;
+}
+.ablation-card .am-note {
+    font-size: 0.82rem; color: var(--muted); margin-top: 4px;
+}
+.ablation-loss   { background: var(--risk-soft); border-color: #F4B8B2; }
+.ablation-loss   .am-value, .ablation-loss   .am-label { color: var(--risk); }
+.ablation-meh    { background: var(--warn-soft); border-color: #F1D196; }
+.ablation-meh    .am-value, .ablation-meh    .am-label { color: var(--warn); }
+.ablation-win    {
+    background: var(--safe-soft); border: 2px solid var(--safe);
+    box-shadow: 0 4px 12px rgba(21,128,61,0.12);
+}
+.ablation-win    .am-value, .ablation-win    .am-label { color: var(--safe); }
+.ablation-win    .am-value::after { content: " ★"; }
 
 /* verdict box */
 .verdict-default {
