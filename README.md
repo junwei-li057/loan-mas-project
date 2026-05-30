@@ -87,6 +87,8 @@ Environment variables:
 
 The single-page UI loads the model directly from the pickle and calls Minimax directly — there is no separate backend service to start.
 
+For hosting on Streamlit Community Cloud, see [docs/deploy.md](docs/deploy.md).
+
 ## Reproducing the training notebook
 
 1. Download the raw dataset and place it as `loan_default.csv` at the repo root (see [data/README.md](data/README.md)).
