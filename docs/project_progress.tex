@@ -49,10 +49,11 @@ proposed text-fusion weight, and merges text-derived risk into the model in
 logit space. The system is exposed through a Streamlit single-page demo
 backed by a training notebook. The headline result is \emph{not} that text
 fusion improves the global model --- on a 4{,}199-row test set the Strategist
-AUC is essentially tied with baseline ($+0.001$, $p = 0.11$). The headline
+AUC is essentially tied with baseline ($+0.0009$, $p = 0.09$). The headline
 result is that the multi-agent system \emph{learns to distrust text by
 default} and lets it act only on a high-confidence subset, where it does
-deliver a real \mbox{$+0.0142$ AUPRC} lift. The body of this document
+deliver a real \mbox{$+0.0129$ AUPRC} lift (a $5.2\%$ relative gain over
+the $0.2466$ baseline on those 210 most-trusted cases). The body of this document
 explains the architecture, data pipeline, and the evidence behind that
 finding so each team member can present a coherent slice.
 
@@ -150,12 +151,13 @@ distrust text by default and gate it through.}
 \textbf{Evidence (combined.pkl test, $n = 4{,}199$):}
 \begin{itemize}
   \item Per-grade $\Delta\mathrm{AUC}$ at the learned weight is essentially
-        zero for every grade: C $-0.0005$, D $-0.0027$, E $+0.0001$,
+        zero for every grade: C $-0.0005$, D $-0.0015$, E $+0.0001$,
         F $-0.0008$, G $-0.0030$. Strategist vs baseline overall is
-        $\Delta\mathrm{AUC} = +0.0011$, DeLong $p = 0.11$.
+        $\Delta\mathrm{AUC} = +0.0009$, DeLong $p = 0.09$.
   \item Restrict to the top 35\% of rows ranked by text confidence and the
         gap reverses: fused AUPRC beats baseline AUPRC by
-        \textbf{$+0.0142$}. Confidence-vs-accuracy slope is $+1.40$ (high
+        \textbf{$+0.0129$} (a $5.2\%$ relative lift over the $0.2466$
+        baseline AUPRC on those rows). Confidence-vs-accuracy slope is $+1.40$ (high
         claimed confidence really is more reliable).
   \item The learned \texttt{best\_strategy} reflects exactly that:
         \emph{small weights everywhere, strict gate}.
@@ -170,15 +172,18 @@ The learned policy, side by side with the previous (small-sample) model:
 & \textbf{C} & \textbf{D} & \textbf{E} & \textbf{F} & \textbf{G} & \texttt{conf\_threshold} \\
 \midrule
 Old (sample1, $n \approx 250$)            & 0.03 & \textbf{0.13} & 0.08 & 0.06 & 0.03 & 0.67 \\
-\textbf{New (combined, $n = 16{,}801$)}   & 0.03 & \textbf{0.10} & 0.05 & 0.03 & 0.03 & \textbf{0.65} \\
+\textbf{New (combined, $n = 16{,}801$)}   & 0.03 & \textbf{0.07} & 0.05 & 0.03 & 0.03 & \textbf{0.63} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 In sample1, the D weight of $0.13$ looked like genuine text benefit. At
-$67\times$ the data, that benefit shrinks to a $0.10$ weight whose own
-\texttt{grade\_train\_stats} entry is mildly negative ($-0.003$). The same
-relaxation happens on E and F. The takeaway for a presentation slide:
+$67\times$ the data, with the LLM Strategist driving the loop, that
+benefit shrinks all the way to a $0.07$ weight whose own
+\texttt{grade\_train\_stats} entry is mildly negative ($-0.0015$). The same
+relaxation happens on E and F, and the confidence threshold itself softens
+from $0.65$ (rule-only retrain) to $0.63$. The takeaway for a presentation
+slide:
 
 \begin{quote}\small\itshape
 ``The small-sample model was over-confident about how useful text is. At
@@ -197,7 +202,7 @@ is concrete enough to earn its place, and it pays for itself there.''
 \textbf{Pipeline} & \textbf{AUC} & \textbf{AUPRC} & \textbf{DeLong $p$ vs baseline} \\
 \midrule
 baseline (XGBoost only)     & 0.6138 & 0.3001 & --- \\
-MAS Strategist (fused)      & 0.6149 & 0.3015 & 0.11 \\
+MAS Strategist (fused)      & 0.6147 & 0.3015 & 0.09 \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -212,14 +217,14 @@ MAS Strategist (fused)      & 0.6149 & 0.3015 & 0.11 \\
 Baseline only           & 0.6138 & $0.0000$ & XGBoost on 16 numeric features \\
 LR stacking             & 0.6094 & $-0.0045$ & LogReg over numeric + text + regex flags \\
 Grid search (best)      & 0.6142 & $+0.0003$ & 1{,}620-combo brute-force grade-weight grid \\
-\textbf{MAS Strategist} & \textbf{0.6149} & $\boldsymbol{+0.0011}$ & Multi-agent LLM-tuned 5-scalar weights \\
+\textbf{MAS Strategist} & \textbf{0.6147} & $\boldsymbol{+0.0009}$ & Multi-agent LLM-tuned 5-scalar weights \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 Two readings of the same table:
 \begin{itemize}
-  \item Pessimist: MAS only beats brute-force grid search by $+0.0008$ AUC.
+  \item Pessimist: MAS only beats brute-force grid search by $+0.0006$ AUC.
   \item Honest: with this baseline strength and this much data, the
         Strategist matches an exhaustive brute-force search while making
         five small \emph{interpretable} decisions per grade. The win is
@@ -273,10 +278,13 @@ here so a team member can answer a ``why is it like this'' question:
 \section{Repository status and how to run}
 
 \textbf{Current branch:} \texttt{main} on
-\url{https://github.com/junwei-li057/loan-mas-project}. Most recent
-commit at the time of writing is the consolidated retrain
-(\texttt{058855f}). The pipeline is self-consistent: model trained on
-combined.pkl, offline report regenerated on the same split.
+\url{https://github.com/junwei-li057/loan-mas-project}. The pipeline is
+self-consistent: model trained on combined.pkl with the LLM Strategist
+actually driving the loop (2 iter, converged), real decision\_log dumped
+to \texttt{data/decision\_log\_sample1.pkl}, and the offline report
+regenerated on the matching test split. Run
+\texttt{git log -1 -{}- models/loan\_default\_model.pkl}
+to see the commit that produced the deployed artefact.
 
 \textbf{To run the demo (no LLM credits required):}
 \begin{verbatim}
