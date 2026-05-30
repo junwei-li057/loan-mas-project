@@ -4,8 +4,15 @@ P3 end-to-end verification.
 Exercises every public function in `evaluation` and writes a real MD report
 to `docs/eval_report_sample1.md`.
 
-Uses sample1's train/test text pkls and the saved model artifact. The
-decision_log is synthetic (we don't re-run the iterative loop here).
+Uses the consolidated text-analyst pkl (`text_ana_results/text_analysis_combined.pkl`,
+21000 borrowers across sample1+sample2+sample4) joined onto `loan_default.csv`
+by LendingClub loan `id`. This matches the training-notebook data path
+(cell 12 of `notebooks/loan_default.ipynb`), so the offline report reflects
+the same train/test split the model was fit on.
+
+The decision_log is loaded from `data/decision_log_sample1.pkl` if present,
+otherwise a 4-iter synthetic stand-in is used and the report header records
+that fact.
 
 Run from project root:
     python notebooks/eval_verify_p3.py
@@ -24,12 +31,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import evaluation as ev  # noqa: E402
-from evaluation._helpers import build_subset, synthesize_decision_log  # noqa: E402
+from evaluation._helpers import build_subset_from_combined, synthesize_decision_log  # noqa: E402
+
+
+COMBINED_PKL = REPO_ROOT / "text_ana_results" / "text_analysis_combined.pkl"
 
 
 def main() -> int:
     print("=" * 78)
-    print("P3 end-to-end verification — full evaluation suite on sample1")
+    print("P3 end-to-end verification — full evaluation suite (combined.pkl)")
     print("=" * 78)
 
     # 1. Load artifacts
@@ -46,16 +56,8 @@ def main() -> int:
     target_train = train_df[train_df["grade"].isin(["C", "D", "E", "F", "G"])].copy()
     target_test = test_df[test_df["grade"].isin(["C", "D", "E", "F", "G"])].copy()
 
-    subset_train = build_subset(
-        target_train,
-        REPO_ROOT / "data/text_analyst_results_train_matched_sample1.pkl",
-        grade_norm_stats,
-    )
-    subset_test = build_subset(
-        target_test,
-        REPO_ROOT / "data/text_analyst_results_test_matched_sample1.pkl",
-        grade_norm_stats,
-    )
+    subset_train = build_subset_from_combined(target_train, COMBINED_PKL, grade_norm_stats)
+    subset_test = build_subset_from_combined(target_test, COMBINED_PKL, grade_norm_stats)
     print(f"\n  subset_train : {len(subset_train)} rows  default={subset_train['label'].mean():.3f}")
     print(f"  subset_test  : {len(subset_test)} rows  default={subset_test['label'].mean():.3f}")
 
@@ -149,7 +151,7 @@ def main() -> int:
         trust_diag=trust,
         out_path=out_path,
         meta={
-            "data": "sample1 (train/test)",
+            "data": f"combined.pkl ({len(subset_train)} train, {len(subset_test)} test; id-joined to loan_default.csv)",
             "model_artifact": "models/loan_default_model.pkl",
             "decision_log": decision_log_source,
         },

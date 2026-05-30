@@ -1,0 +1,6 @@
+# Pin the theme to light so the demo's inline CSS (which uses fixed light-palette
+# chip colors like #d1fae5 / #065f46) renders correctly regardless of the
+# viewer's system or browser theme. Without this, Streamlit follows system
+# preferences and dark mode breaks the chip / card contrast.
+[theme]
+base = "light"

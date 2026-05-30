@@ -37,7 +37,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import evaluation as ev  # noqa: E402
-from evaluation._helpers import build_subset, synthesize_decision_log  # noqa: E402
+from evaluation._helpers import build_subset_from_combined, synthesize_decision_log  # noqa: E402
+
+
+COMBINED_PKL = REPO_ROOT / "text_ana_results" / "text_analysis_combined.pkl"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -45,7 +48,7 @@ from evaluation._helpers import build_subset, synthesize_decision_log  # noqa: E
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> int:
     print("=" * 78)
-    print("P2 verification — evaluation.core + evaluation.agent on sample1")
+    print("P2 verification — evaluation.core + evaluation.agent (combined.pkl)")
     print("=" * 78)
 
     # Load model artifact
@@ -64,9 +67,9 @@ def main() -> int:
         df_all, test_size=0.2, random_state=42, stratify=df_all["label"]
     )
     target_test = test_df[test_df["grade"].isin(["C", "D", "E", "F", "G"])].copy()
-    subset_test = build_subset(
+    subset_test = build_subset_from_combined(
         target_test,
-        REPO_ROOT / "data/text_analyst_results_test_matched_sample1.pkl",
+        COMBINED_PKL,
         grade_norm_stats,
     )
     print(f"\nReconstructed subset_test : {len(subset_test)} rows  "
