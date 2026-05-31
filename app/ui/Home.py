@@ -89,7 +89,7 @@ def historical_text_impact(delta: float, key: str = "") -> str:
     ], key)
 
 # ── LLM helpers ───────────────────────────────────────────────────────────────
-def call_llm(prompt, max_tokens=300, temperature=0.3, response_format_json=False):
+def call_llm(prompt, max_tokens=300, temperature=0.3, response_format_json=False, timeout=60):
     api_key = get_minimax_api_key()
     if not api_key:
         raise RuntimeError("MINIMAX_API_KEY is not set. Set it before running the Streamlit demo.")
@@ -103,11 +103,15 @@ def call_llm(prompt, max_tokens=300, temperature=0.3, response_format_json=False
     if response_format_json:
         payload["response_format"] = {"type": "json_object"}
 
+    # 60s default — MiniMax-M2.7 thinking mode regularly takes 20-40s for
+    # multi-paragraph JSON output (Green LLM Review especially: 1200 tokens +
+    # thinking + complex flip-gate reasoning). 30s timeout was hitting
+    # ReadTimeout on borderline cases. Callers can override per-call.
     resp = requests.post(
         MINIMAX_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json=payload,
-        timeout=30,
+        timeout=timeout,
     )
     try:
         data = resp.json()
@@ -520,7 +524,10 @@ def reporter(row_dict, baseline, fused, grade, text_score, text_reasoning,
         f'Output exactly this JSON object: {{"paragraph_1": "<finished prose for paragraph 1>", '
         f'"paragraph_2": "<finished prose for paragraph 2>"}}'
     )
-    raw = call_llm(prompt, max_tokens=3000, temperature=0.25, response_format_json=True)
+    # Lower temperature + slightly bigger budget reduces the rate at which
+    # MiniMax-M2.7 exhausts max_tokens inside its thinking block and never
+    # produces the JSON output.
+    raw = call_llm(prompt, max_tokens=4500, temperature=0.15, response_format_json=True)
     try:
         obj = _extract_json_object(raw)
         p1 = str(obj.get("paragraph_1", "")).strip()
@@ -531,10 +538,22 @@ def reporter(row_dict, baseline, fused, grade, text_score, text_reasoning,
             return p1 or p2
     except Exception:
         pass
-    return _reporter_deterministic_fallback(
+    # LLM path failed (truncated JSON / empty fields / parse error). Fall
+    # back to deterministic prose — guaranteed non-empty.
+    fallback = _reporter_deterministic_fallback(
         row_dict, baseline, fused, grade, text_score, text_reasoning,
         effective_weight, confidence, veto_active, hist_delta, threshold,
     )
+    # Last-resort sanity guard: the deterministic fallback above should never
+    # return an empty string, but if a future refactor breaks it we still
+    # owe the user a non-blank panel rather than silent failure.
+    if not fallback.strip():
+        fallback = (
+            f"[Reporter fallback] Grade {grade} borrower; baseline={baseline:.3f}, "
+            f"fused={fused:.3f}, threshold={threshold:.2f}, "
+            f"effective text weight={effective_weight:.2f}."
+        )
+    return fallback
 
 
 def _reporter_deterministic_fallback(
@@ -649,37 +668,69 @@ def run_strategist_llm(grade, baseline_pred, text_score, text_confidence,
         f"Historical text impact: {history_summary}\n"
         f"Reason: {hist_reason}"
     )
+    # Scale the recommended exception size by how conservative the grade
+    # baseline is. Grades with learned ≤ 0.05 (C/F/G) need a *bigger* bump
+    # to be visible — proposing learned + 0.03 on Grade C (learned 0.03) only
+    # gets you to 0.06, which a soft veto can easily knock back to ~0.04 and
+    # the case ends up indistinguishable from keep_learned. Bigger bumps on
+    # low-baseline grades give the Advocate / Green arbitration real material to
+    # negotiate with.
+    if learned_w <= 0.05:
+        bump_guidance = (
+            f"learned + 0.05 to learned + 0.10 (= 0.{int((learned_w + 0.05)*100):02d}–"
+            f"0.{int(min(0.20, learned_w + 0.10)*100):02d}). Grade {grade}'s learned weight "
+            f"is conservative ({learned_w:.2f}), so a small bump like +0.02 would be "
+            f"swallowed by Advocate compromise and the exception becomes invisible — "
+            f"go meaningfully above"
+        )
+    else:
+        bump_guidance = (
+            f"learned + 0.03 to learned + 0.07 (= 0.{int((learned_w + 0.03)*100):02d}–"
+            f"0.{int(min(0.20, learned_w + 0.07)*100):02d}). Grade {grade}'s learned weight "
+            f"is already substantial ({learned_w:.2f}); modest bumps suffice"
+        )
+
     weight_rules = (
         "- The static weight is conservative grade policy. case_specific_exception or fuzzy_only "
         "means propose an INCREASE above this baseline when the case warrants extra text influence.\n"
-        "- proposed_weight must be STRICTLY GREATER than learned when you choose case_specific_exception "
-        "or fuzzy_only (typically learned + 0.03 to learned + 0.10). If you would propose a value equal "
-        "to learned, you must instead choose keep_learned or explanation_only — do NOT label a no-op as "
-        "case_specific_exception.\n"
+        f"- proposed_weight must be STRICTLY GREATER than learned when you choose case_specific_exception "
+        f"or fuzzy_only — recommended range for THIS grade: {bump_guidance}. If you would propose a "
+        f"value equal to learned, you must instead choose keep_learned or explanation_only — do NOT "
+        f"label a no-op as case_specific_exception.\n"
         "- proposed_weight must equal learned for keep_learned / explanation_only / human_review.\n"
         "- Use a modest increase when historical text impact is unstable or harmful, because the "
         "Advocate may veto and Green will then arbitrate. Do not refuse to propose simply because of "
         "veto risk — that is what the Advocate and Green arbitration are for.\n"
         "- proposed_weight must be in [0.00, 0.20].\n"
+        f"- SELF-COHERENCE RULE on `min_text_confidence`: if you set this constraint, it MUST be "
+        f"≤ the current text confidence shown above ({text_confidence:.2f}). If you would set it "
+        f"higher, you are proposing an exception with an unreachable gate — your case_specific_exception "
+        f"becomes a no-op and the system falls back to the learned weight. When in doubt, OMIT this "
+        f"constraint entirely — the global conf_threshold already gates low-confidence cases.\n"
     )
 
     decision_heuristics = (
-        "=== Decision heuristics (read carefully) ===\n"
-        "Pick strategy_type by what the case actually warrants, not by what feels safe:\n\n"
-        "- case_specific_exception: choose this when text_confidence >= 0.80 AND |score_gap| >= 0.25 "
-        "AND the description contains concrete verifiable details (employment tenure, exact income, "
-        "explicit payment-history claim, named profession, specific debt purpose). In this regime the "
-        "text is carrying real signal that disagrees with the numeric model, and your job is to let "
-        "it nudge the weight up. A typical exception is learned + 0.05, capped by max_prediction_shift "
-        "around 0.05; the Advocate decides whether to veto.\n"
-        "- fuzzy_only: choose when baseline is in fuzzy zone but the text justification rests primarily "
-        "on the fuzzy-zone status rather than on description-specific evidence.\n"
-        "- explanation_only: this is NOT a polite default. Use it only when the text is vague, short, "
-        "lacks specifics, or merely echoes the numeric verdict. A confident, detailed, strongly "
-        "disagreeing text is the OPPOSITE of explanation_only — it is the prototypical "
-        "case_specific_exception case. Do not retreat to explanation_only just because the historical "
-        "subgroup impact is mixed.\n"
-        "- keep_learned: text adds no new information (low confidence, or aligns with baseline).\n"
+        "=== Decision rules (HARD — server-side validated) ===\n"
+        "Pick strategy_type by what the case actually warrants. The first two rules below are\n"
+        "HARD prerequisites — if violated, the server will auto-demote your choice to keep_learned\n"
+        "with a visible warning. Do not propose exceptions you are not entitled to.\n\n"
+        f"- case_specific_exception — REQUIRES ALL of:\n"
+        f"    (a) text_confidence >= 0.80   (this case: {text_confidence:.2f})\n"
+        f"    (b) |score_gap| >= 0.25       (this case: {abs(score_gap):.2f})\n"
+        f"    (c) description has concrete verifiable details (employment tenure, exact income,\n"
+        f"        explicit payment-history claim, named profession, specific debt purpose).\n"
+        f"  If ANY of (a)(b)(c) fails, you MUST choose keep_learned instead. Do not try to \n"
+        f"  override on the strength of (b) or (c) alone — sub-threshold confidence is a hard NO,\n"
+        f"  because LLM self-rated confidence below 0.80 is the system's signal that text is not\n"
+        f"  reliable enough to deviate from grade policy.\n"
+        f"- fuzzy_only — same confidence floor (>= 0.80) applies. Use only when baseline is in fuzzy\n"
+        f"  zone AND the text justification rests primarily on the fuzzy-zone status rather than on\n"
+        f"  description-specific evidence.\n"
+        "- explanation_only: text informs the Reporter narrative but does NOT change weight. Use\n"
+        "  when text is vague or merely echoes the numeric verdict — but NOT as a polite default for\n"
+        "  strong but sub-threshold-confidence cases (those should be keep_learned).\n"
+        "- keep_learned: the safe correct choice whenever any case_specific_exception prerequisite\n"
+        "  fails. The Grade's learned weight already accounts for typical text usefulness.\n"
         "- human_review: reserve for genuine ambiguity where automated reasoning is unsafe.\n\n"
     )
 
@@ -725,18 +776,87 @@ def run_strategist_llm(grade, baseline_pred, text_score, text_confidence,
         '"only_if_fuzzy_zone": <true/false>}, "rationale": "<one sentence>", '
         '"display_brief": "<complete UI-ready sentence, max 30 words, no ellipsis>"}'
     )
-    raw = call_llm(prompt, max_tokens=1200, temperature=0.2, response_format_json=True)
+    # max_tokens 2500 (was 1200): the prompt now includes decision_heuristics +
+    # grade-aware weight_rules + self-coherence rule — thinking models like
+    # MiniMax-M2.7 routinely burn 1500+ tokens reasoning before the JSON
+    # output, so 1200 was truncating JSON ~half the time and silently falling
+    # back to keep_learned.
+    raw = call_llm(prompt, max_tokens=2500, temperature=0.15, response_format_json=True)
     try:
         result = _extract_json_object(raw)
-    except Exception:
-        result = {"strategy_type": "keep_learned", "proposed_weight": learned_w,
-                  "constraints": {}, "rationale": "[parse error — defaulting to learned strategy]",
-                  "display_brief": "Strategist output could not be parsed, so the learned grade-level text weight was kept."}
+        result["_parse_ok"] = True
+    except Exception as e:
+        # Make the parse-failure path VISIBLE in the UI so it stops looking
+        # like a legitimate keep_learned decision. The display_brief is
+        # prefixed with ⚠️ so reviewers spot it instantly.
+        result = {
+            "strategy_type": "keep_learned",
+            "proposed_weight": learned_w,
+            "constraints": {},
+            "rationale": f"[Strategist JSON parse failed: {e}] — defaulting to learned weight as a safe fallback.",
+            "display_brief": "⚠️ Strategist LLM response could not be parsed as JSON — falling back to the learned grade weight (not an actual keep_learned decision).",
+            "_parse_ok": False,
+            "_parse_error": str(e),
+        }
 
     # Safety clamp: keep the legacy upward-only ceiling of learned + 0.15 (cap [0, 0.2]).
     proposed = float(result.get("proposed_weight", learned_w))
     lo, hi = 0.0, min(0.20, learned_w + 0.15)
     result["proposed_weight"] = round(min(max(proposed, lo), hi), 3)
+
+    # HARD enforcement: case_specific_exception and fuzzy_only require
+    # text_confidence >= 0.80. If the LLM ignored the prompt heuristic and
+    # picked an exception anyway, demote to keep_learned. This matches the
+    # prompt's "decision rules (HARD)" section and gives the demo a
+    # consistent, auditable behavior: low-confidence cases NEVER deviate
+    # from the grade-learned weight, regardless of LLM enthusiasm.
+    if (result.get("strategy_type") in ("case_specific_exception", "fuzzy_only")
+        and text_confidence < 0.80):
+        original_type = result["strategy_type"]
+        result["_auto_demoted_from"] = original_type
+        result["_auto_demote_reason"] = f"text_confidence {text_confidence:.2f} < 0.80"
+        result["strategy_type"] = "keep_learned"
+        result["proposed_weight"] = round(learned_w, 3)
+        result["constraints"] = {}
+        result["rationale"] = (
+            f"[auto-demoted from `{original_type}`: text_confidence "
+            f"{text_confidence:.2f} is below the 0.80 minimum required for "
+            f"case-level exceptions. The LLM's proposed deviation has been "
+            f"replaced with the Grade {grade} learned weight ({learned_w:.2f}) "
+            f"to enforce the system's confidence floor.] "
+            + (result.get("rationale", "") or "")
+        )
+        result["display_brief"] = (
+            f"⚠️ Auto-demoted from {original_type} to keep_learned "
+            f"(text confidence {text_confidence:.2f} < 0.80 floor)."
+        )
+
+    # Sanity: Strategist must not propose an exception with a self-defeating
+    # `min_text_confidence` that exceeds the current case's text confidence.
+    # Letting that through produced the "Strategist nominally chose
+    # case_specific_exception but text was suppressed anyway" UI rows.
+    # We relax the unreachable gate down to the current confidence so the
+    # exception is actually reachable; the rationale records the auto-fix.
+    cst = result.get("constraints") or {}
+    if isinstance(cst, dict):
+        mtc = cst.get("min_text_confidence")
+        if (mtc is not None
+            and result.get("strategy_type") in ("case_specific_exception", "fuzzy_only")):
+            try:
+                mtc_f = float(mtc)
+                if mtc_f > text_confidence + 1e-6:
+                    new_mtc = round(min(text_confidence, 0.95), 2)
+                    cst["min_text_confidence"] = new_mtc
+                    result["constraints"] = cst
+                    result["rationale"] = (
+                        f"[auto-relaxed min_text_confidence={mtc_f:.2f}→{new_mtc:.2f} "
+                        f"so the case-specific exception is reachable for this borrower "
+                        f"(actual confidence {text_confidence:.2f})] "
+                        + (result.get("rationale", "") or "")
+                    )
+            except (TypeError, ValueError):
+                pass
+
     return result, raw
 
 def run_advocate_llm(grade, baseline_pred, text_score, confidence,
@@ -952,16 +1072,22 @@ def run_green_llm(baseline_pred, fused_before, fused_after, text_score,
         f'"final_pred": <float>, "reasoning": "<one sentence citing the specific numbers from above>", '
         f'"display_brief": "<complete UI-ready sentence, max 30 words, no ellipsis>"}}'
     )
-    raw = call_llm(prompt, max_tokens=1200, temperature=0.2, response_format_json=True)
+    # max_tokens 2500 + temperature 0.15 — same fix as Strategist / Reporter.
+    # Green LLM Review is the last-chance reviewer when hard rules fire on a
+    # borderline case; it routinely needs >1500 tokens of thinking. Old 1200
+    # was being truncated and silently falling back to accept_baseline.
+    raw = call_llm(prompt, max_tokens=2500, temperature=0.15, response_format_json=True)
     try:
         result = _extract_json_object(raw)
         lo, hi = min(baseline_pred, fused_before), max(baseline_pred, fused_before)
         result["final_pred"] = round(float(np.clip(float(result.get("final_pred", fused_after)), lo, hi)), 4)
         return result, raw
     except Exception as e:
+        # Visible parse-failure fallback (same pattern as run_strategist_llm) —
+        # do NOT pretend a parse-failure is a legitimate "accept_baseline".
         return {"decision": "accept_baseline", "final_pred": baseline_pred,
-                "reasoning": f"[parse error: {e}]",
-                "display_brief": "Green review output could not be parsed, so the baseline decision was retained."}, raw
+                "reasoning": f"[Green LLM Review JSON parse failed: {e}] — defaulting to baseline as a safe fallback.",
+                "display_brief": "⚠️ Green LLM Review response could not be parsed as JSON — falling back to baseline (not an actual review decision)."}, raw
 
 def text_risk_label(score: float) -> str:
     if score < 0.25:   return "🟢 Low"
@@ -972,62 +1098,67 @@ def text_risk_label(score: float) -> str:
 
 # ── Preset demo cases ─────────────────────────────────────────────────────────
 PRESETS = {
-    # Case 1: Grade C, protective text → Strategist proposes weight increase → HARD VETO
-    # Grade C delta=-0.054 < -0.02 → hard veto; Green enforces subgroup protection.
-    # Narrative: borrower sounds trustworthy, but Grade C text historically hurts AUC badly
-    "Case 1 · Grade C — Green enforces hard veto": {
-        "grade": "C", "loan_amnt": 14000, "int_rate": 17.5, "installment": 350.0,
-        "annual_inc": 68000, "dti": 14.0, "delinq_2yrs": 0, "fico_low": 705,
-        "fico_high": 709, "inq_6mths": 1, "open_acc": 12, "pub_rec": 0,
-        "revol_bal": 7000, "revol_util": 38.0, "total_acc": 22, "mort_acc": 1,
+    # ── Case 1 · Grade D — Borderline borrower, strong text → fusion flips verdict ──
+    # Numeric profile is just above the 0.50 threshold (baseline ≈ 0.54). The
+    # description is detailed and consistent (RN, 9 years tenure, perfect payment
+    # history, explicit consolidation purpose) so the Text Analyst returns very
+    # low text_risk_score (≈ 0.07) at high confidence (≈ 0.93). Grade D's
+    # learned weight is 0.07 — sufficient on its own to push fused below 0.50,
+    # and the Strategist often proposes a small case-specific exception on top.
+    # The full Strategist → Advocate → Green flow runs and the verdict flips
+    # from DEFAULT to NON-DEFAULT.
+    "Case 1 · Grade D — Strong text flips a borderline verdict": {
+        "grade": "D", "loan_amnt": 13500, "int_rate": 14.8, "installment": 320.0,
+        "annual_inc": 69000, "dti": 17.5, "delinq_2yrs": 0, "fico_low": 698,
+        "fico_high": 702, "inq_6mths": 1, "open_acc": 10, "pub_rec": 0,
+        "revol_bal": 7800, "revol_util": 45.0, "total_acc": 20, "mort_acc": 1,
         "pub_rec_bk": 0,
         "desc": (
-            "I am a registered nurse with 9 years of continuous employment at the same "
-            "hospital. My annual salary is $68,000 and I have never missed a single "
-            "payment on any account. I am consolidating two low-balance credit cards "
-            "to simplify my finances and reduce my interest rate."
+            "I have been working as a registered nurse at the same hospital for nine "
+            "years with a stable annual salary of $68,000 and a FICO score around 705. "
+            "I have never missed a single payment on any account, and all my credit "
+            "accounts are currently in good standing. I am consolidating two "
+            "low-balance credit cards (about $4,500 combined) to simplify my finances "
+            "and reduce my overall interest rate."
         ),
     },
-    # Case 2: Grade E, protective text → Strategist proposes weight increase → SOFT VETO
-    # Grade E delta=-0.018, in range [-0.02, 0) → soft veto; Green negotiates a constrained compromise.
-    # Narrative: similar trustworthy borrower, but Grade E text marginally harmful — room for compromise
-    "Case 2 · Grade E — Green arbitrates soft veto": {
-        "grade": "E", "loan_amnt": 14000, "int_rate": 17.5, "installment": 350.0,
-        "annual_inc": 68000, "dti": 14.0, "delinq_2yrs": 0, "fico_low": 705,
-        "fico_high": 709, "inq_6mths": 1, "open_acc": 12, "pub_rec": 0,
-        "revol_bal": 7000, "revol_util": 38.0, "total_acc": 22, "mort_acc": 1,
+
+    # ── Case 3 · Grade D — Low risk but modest confidence → Strategist keeps learned ──
+    # The description hints at stability but stays vague — no concrete employment,
+    # income figure, or repayment plan. Text Analyst's confidence_cap rule keeps
+    # confidence around 0.65–0.75, and the LLM's own raw confidence on a generic
+    # narrative tends low. The Strategist's decision heuristics require
+    # confidence ≥ 0.80 AND |score_gap| ≥ 0.25 to propose a case_specific_exception,
+    # so it falls back to `keep_learned`: text fusion proceeds at the Grade D
+    # learned weight (0.07), not at an LLM-tuned exception.
+    "Case 3 · Grade D — Modest confidence → Strategist keeps learned": {
+        "grade": "D", "loan_amnt": 14000, "int_rate": 15.0, "installment": 330.0,
+        "annual_inc": 68000, "dti": 17.0, "delinq_2yrs": 0, "fico_low": 695,
+        "fico_high": 699, "inq_6mths": 1, "open_acc": 11, "pub_rec": 0,
+        "revol_bal": 8000, "revol_util": 47.0, "total_acc": 20, "mort_acc": 1,
         "pub_rec_bk": 0,
         "desc": (
-            "I have worked as a hospital nurse for 9 years with a stable annual salary "
-            "of $68,000. I have no missed payments and am using this loan to consolidate "
-            "credit card debt at a lower rate. My finances are well-managed and I am "
-            "confident I can meet the monthly repayments without difficulty."
+            "I am a banker working for 9 years, with not bad salary. I have never "
+            "missed a single payment on any account, and all my credit accounts are "
+            "currently in good standing. I am consolidating two low-balance credit cards."
         ),
     },
-    # Case 3: Grade D, protective text → Strategist proposes weight increase → NO VETO
-    # Grade D delta=+0.018 ≥ 0 → Advocate passes; fusion lowers prediction (text helps)
-    # Narrative: same trustworthy borrower, Grade D text historically improves AUC — approved
-    "Case 3 · Grade D — Strategist passes cleanly": {
-        "grade": "D", "loan_amnt": 14000, "int_rate": 17.5, "installment": 350.0,
-        "annual_inc": 68000, "dti": 14.0, "delinq_2yrs": 0, "fico_low": 705,
-        "fico_high": 709, "inq_6mths": 1, "open_acc": 12, "pub_rec": 0,
-        "revol_bal": 7000, "revol_util": 38.0, "total_acc": 22, "mort_acc": 1,
+
+    # ── Case 4 · Grade F — Poor / emotional narrative → global gate closes text ──
+    # The description is short, urgent, and contains zero concrete evidence
+    # (no employment, income, repayment plan, or specific loan purpose). The
+    # Text Analyst's confidence_cap_for_text rule caps confidence at 0.55–0.62
+    # because of the lack of detail; the global conf_threshold (0.63) closes
+    # the text gate entirely. fused = baseline regardless of what risk score
+    # the LLM eventually returns. Reporter still runs (case is in fuzzy zone)
+    # and writes the "text was heard but not trusted" narrative.
+    "Case 4 · Grade F — Poor narrative → global gate closes text": {
+        "grade": "F", "loan_amnt": 12000, "int_rate": 15.5, "installment": 290.0,
+        "annual_inc": 58000, "dti": 20.0, "delinq_2yrs": 0, "fico_low": 688,
+        "fico_high": 692, "inq_6mths": 2, "open_acc": 9, "pub_rec": 0,
+        "revol_bal": 7500, "revol_util": 55.0, "total_acc": 18, "mort_acc": 0,
         "pub_rec_bk": 0,
-        "desc": (
-            "I am a registered nurse with 9 years of continuous employment at the same "
-            "hospital. My annual salary is $68,000 and I have never missed a single "
-            "payment on any account. I am consolidating two low-balance credit cards "
-            "to simplify my finances and reduce my interest rate."
-        ),
-    },
-    # Case 4: Grade D, confidence too low — text analyst confidence < 0.65, text signal ignored
-    "Case 4 · Grade D — Low confidence, text ignored": {
-        "grade": "D", "loan_amnt": 14000, "int_rate": 17.5, "installment": 350.0,
-        "annual_inc": 68000, "dti": 14.0, "delinq_2yrs": 0, "fico_low": 705,
-        "fico_high": 709, "inq_6mths": 1, "open_acc": 12, "pub_rec": 0,
-        "revol_bal": 7000, "revol_util": 38.0, "total_acc": 22, "mort_acc": 1,
-        "pub_rec_bk": 0,
-        "desc": "I need this loan.",
+        "desc": "i really need this money urgent please. things are very tough now thanks.",
     },
 }
 
@@ -1346,15 +1477,65 @@ h1, h2, h3, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 10px;
+    gap: 14px;
+    margin-bottom: 8px;
 }
 .preset-title strong {
     color: var(--ink);
-    font-size: 0.96rem;
+    font-size: 1.02rem;
 }
 .preset-title span {
     color: var(--muted);
-    font-size: 0.78rem;
+    font-size: 0.80rem;
+}
+.preset-pill {
+    background: var(--primary-soft);
+    color: var(--primary);
+    border: 1px solid var(--primary-soft-2);
+    border-radius: 999px;
+    padding: 4px 9px;
+    font-size: 0.72rem;
+    font-weight: 760;
+    white-space: nowrap;
+}
+.preset-shell-marker {
+    height: 0;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+}
+.stMarkdown:has(.preset-shell-marker),
+div[data-testid="stMarkdown"]:has(.preset-shell-marker),
+div.element-container:has(.preset-shell-marker) {
+    height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+}
+div.element-container:has(.preset-shell-marker) + div.element-container div[data-testid="stVerticalBlockBorderWrapper"] {
+    background: linear-gradient(135deg, rgba(255,255,255,0.94), rgba(248,247,251,0.96));
+    border-color: #D8D0E6;
+    border-radius: 14px;
+    box-shadow: 0 10px 24px rgba(31,27,45,0.06);
+    padding: 14px 16px 16px;
+}
+div.element-container:has(.preset-shell-marker) + div.element-container div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stHorizontalBlock"] {
+    gap: 0.75rem;
+}
+div.element-container:has(.preset-shell-marker) + div.element-container div[data-testid="stVerticalBlockBorderWrapper"] button {
+    border-radius: 10px;
+    min-height: 3rem;
+    background: #FFFFFF;
+    border: 1px solid #DCD6E8;
+    box-shadow: 0 3px 10px rgba(31,27,45,0.04);
+    font-size: 0.84rem;
+    font-weight: 760;
+}
+div.element-container:has(.preset-shell-marker) + div.element-container div[data-testid="stVerticalBlockBorderWrapper"] button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 7px 16px rgba(78,42,132,0.12);
+    border-color: var(--primary);
+    background: var(--primary-soft);
 }
 
 div[data-testid="stHorizontalBlock"] button {
@@ -1746,29 +1927,31 @@ if not MINIMAX_API_KEY:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ── Preset scenario buttons ───────────────────────────────────────────────────
-st.markdown(
-    """
-<div class="preset-band">
-  <div class="preset-title">
-    <strong>Demo cases</strong>
+preset_short_labels = [
+    "01 · D · Verdict flips",
+    "02 · D · Keep learned",
+    "03 · F · Gate closes",
+]
+st.markdown('<div class="preset-shell-marker"></div>', unsafe_allow_html=True)
+with st.container(border=True):
+    st.markdown(
+        """
+<div class="preset-title">
+  <div>
+    <strong>Demo cases</strong><br>
     <span>Load one scenario, then run the full agent analysis</span>
   </div>
+  <div class="preset-pill">3 scenarios</div>
 </div>
-    """,
-    unsafe_allow_html=True,
-)
-preset_short_labels = [
-    "C · Advocate veto",
-    "E · Arbitration",
-    "D · Clean pass",
-    "D · Low confidence",
-]
-preset_cols = st.columns(len(PRESETS))
-for i, (label, vals) in enumerate(PRESETS.items()):
-    button_label = preset_short_labels[i] if i < len(preset_short_labels) else label
-    if preset_cols[i].button(button_label, width="stretch", key=f"preset_{i}", help=label):
-        for k, v in vals.items():
-            st.session_state[f"field_{k}"] = v
+        """,
+        unsafe_allow_html=True,
+    )
+    preset_cols = st.columns(len(PRESETS))
+    for i, (label, vals) in enumerate(PRESETS.items()):
+        button_label = preset_short_labels[i] if i < len(preset_short_labels) else label
+        if preset_cols[i].button(button_label, width="stretch", key=f"preset_{i}", help=label):
+            for k, v in vals.items():
+                st.session_state[f"field_{k}"] = v
 
 st.markdown('<div class="section-break"></div>', unsafe_allow_html=True)
 
@@ -2310,20 +2493,47 @@ with col_output:
                         st.markdown("**Status:** Idle.")
 
             # Final effective weight — apply Strategist constraints
+            #
+            # Two-layer gate semantics:
+            #   1. GLOBAL gate (conf_threshold from best_strategy) — if not passed,
+            #      text genuinely doesn't participate ⇒ effective_w = 0. This is the
+            #      system-wide policy and overrides everything below.
+            #   2. CASE-LEVEL constraints (Strategist's `min_text_confidence`,
+            #      `only_if_fuzzy_zone`, `max_prediction_shift`) — these only veto
+            #      the *case-specific exception*. When they fail we must FALL BACK
+            #      TO `learned_w` (the grade-level default the system already
+            #      learned), not to zero. Zero would mean "this borrower gets no
+            #      text fusion at all", which is much stronger than what a case-
+            #      level constraint expresses.
             effective_w = final_w if conf_ok else 0.0
             constraint_note = ""
-            if stype in ("explanation_only", "human_review"):
+            if not conf_ok:
+                constraint_note = (
+                    f"Global `conf_threshold={conf_threshold:.2f}` — LLM confidence "
+                    f"{confidence:.2f} below threshold; text suppressed system-wide."
+                )
+            elif stype in ("explanation_only", "human_review"):
                 effective_w    = 0.0
                 constraint_note = f"Strategy `{stype}` — text is evidence only, weight forced to 0."
             elif effective_w > 0 and cst:
                 if cst.get("only_if_fuzzy_zone") and not baseline_fuzzy:
-                    effective_w    = 0.0
-                    constraint_note = "Strategist constraint `only_if_fuzzy_zone=true` — baseline not in fuzzy zone, weight suppressed."
+                    effective_w    = learned_w
+                    constraint_note = (
+                        f"Case-level `only_if_fuzzy_zone=true` not met (baseline "
+                        f"{baseline_pred:.3f} outside fuzzy zone); exception suppressed, "
+                        f"falling back to global learned weight `{learned_w:.3f}` for "
+                        f"Grade {grade}."
+                    )
                 if effective_w > 0:
                     min_conf = cst.get("min_text_confidence")
                     if min_conf and confidence < float(min_conf):
-                        effective_w    = 0.0
-                        constraint_note = f"Strategist constraint `min_text_confidence={min_conf}` — LLM confidence {confidence:.2f} too low."
+                        effective_w    = learned_w
+                        constraint_note = (
+                            f"Case-level `min_text_confidence={min_conf}` not met "
+                            f"(confidence {confidence:.2f}); case-specific exception "
+                            f"suppressed, falling back to global learned weight "
+                            f"`{learned_w:.3f}` for Grade {grade}."
+                        )
                 if effective_w > 0:
                     max_shift = cst.get("max_prediction_shift")
                     if max_shift:
@@ -2388,8 +2598,18 @@ with col_output:
         # ── Green Agent: Final Authority Check ───────────────────────────────
         # Green independently validates the fused result before verdict is issued.
         # The shift cap is a safety rail for the static 5-scalar text weights.
+        # Calibration history (May 2026):
+        #   MAX_SHIFT 0.12 → 0.18 — the old 0.12 ceiling clipped legitimate
+        #                          borderline flips before they ever reached
+        #                          the flip gate; widened so the flip gate is
+        #                          the actual gate, not a redundant clip.
+        #   conf_req risky→safe 0.87 → 0.85 — Text Analyst LLM confidence has
+        #                          ~±0.02 run-to-run variance, so 0.87 was a
+        #                          hard cliff that killed conf=0.86 cases.
+        #                          0.85 leaves a one-tick margin without
+        #                          giving up the asymmetric-safety principle.
         THRESHOLD    = 0.5
-        MAX_SHIFT    = 0.12
+        MAX_SHIFT    = 0.18
 
         _fused_before_green = fused_pred
         green_action  = "accepted"
@@ -2413,8 +2633,10 @@ with col_output:
             fused_verdict    = fused_pred    >= THRESHOLD
             if baseline_verdict != fused_verdict:
                 flip_type = "risky→safe" if baseline_verdict else "safe→risky"
-                # Clearing a default needs stronger evidence than raising one
-                conf_req = 0.87 if baseline_verdict else 0.82
+                # Clearing a default needs stronger evidence than raising one,
+                # but the gap is smaller than the prior 0.05 (0.87 vs 0.82).
+                # Text-distance requirement stays — that one is well-calibrated.
+                conf_req = 0.85 if baseline_verdict else 0.80
                 text_req = 0.35 if baseline_verdict else 0.25
                 text_gap = abs(text_score_for_fusion - 0.5)
                 flip_ok  = (confidence >= conf_req) and (text_gap >= text_req)
@@ -2562,20 +2784,23 @@ with col_output:
                                             hist_delta=_hist_for_reporter,
                                             threshold=threshold)
                     except Exception as e:
+                        # `reporter()` has its own deterministic fallback that
+                        # guarantees a non-empty return; this except is reached
+                        # only when an exception is raised *outside* that path
+                        # (e.g. network error in call_llm before the try block).
                         narrative = (
-                            f"Reporter LLM unavailable: {e}\n\n"
-                            f"Fallback summary: numeric baseline={baseline_pred:.3f}, "
-                            f"final fused score={fused_pred:.3f}, threshold={threshold:.2f}. "
-                            f"Text score={text_score_for_fusion:.3f}, confidence={confidence:.3f}, "
+                            f"Reporter unavailable: {e}\n\n"
+                            f"Numeric baseline={baseline_pred:.3f}, fused={fused_pred:.3f}, "
+                            f"threshold={threshold:.2f}. Text score={text_score_for_fusion:.3f}, "
+                            f"confidence={confidence:.3f}, "
                             f"effective text weight={_eff_w_for_reporter:.3f}."
                         )
-                    narrative = strip_llm_thinking(narrative)
-                    if not narrative:
-                        narrative = (
-                            f"Reporter returned hidden reasoning only. Fallback summary: "
-                            f"baseline={baseline_pred:.3f}, fused={fused_pred:.3f}, "
-                            f"text shift={fused_pred - baseline_pred:+.3f}."
-                        )
+                    # Intentionally DO NOT run `strip_llm_thinking(narrative)` here:
+                    # `reporter()` already returns clean prose (LLM JSON path
+                    # parsed via _extract_json_object, or deterministic fallback).
+                    # The extra strip used to silently blank non-empty fallbacks
+                    # whenever the prose happened to contain the literal token
+                    # "<think>" — which produced the "..." panels.
                     elapsed = time.time() - t0
                 st.info(narrative)
                 st.caption(f"⏱ {elapsed:.1f}s | fused={fused_pred:.3f} in fuzzy zone [{FUZZY_LO}–{FUZZY_HI}] "
