@@ -20,8 +20,8 @@ The Streamlit page ships with four preset borrowers in [app/ui/Home.py](app/ui/H
 
 | Case | Grade | What it demonstrates |
 |---|---|---|
-| **Case 1 — Arbitrator sides with Advocate** | C | Strongly protective text + grade where text is historically harmful → Strategist proposes increase → Advocate **hard-vetoes** → Green arbitration enforces the veto. Fused score equals baseline. |
-| **Case 2 — Arbitrator sides with Strategist** | E | Same borrower profile, grade where text is only marginally harmful → Advocate **soft-vetoes** → Green arbitration negotiates a compromise weight. |
+| **Case 1 — Green enforces hard veto** | C | Strongly protective text + grade where text is historically harmful → Strategist proposes increase → Advocate **hard-vetoes** → Green arbitration enforces the veto. Fused score equals baseline. |
+| **Case 2 — Green arbitrates soft veto** | E | Same borrower profile, grade where text is only marginally harmful → Advocate **soft-vetoes** → Green arbitration negotiates a compromise weight. |
 | **Case 3 — Strategist passes cleanly** | D | Protective text in a grade where text history is favorable → no veto → fusion lowers the prediction. |
 | **Case 4 — Low confidence, text ignored** | D | Empty / vague description → `text_confidence` falls below `conf_threshold` → text gate closes, fused = baseline. |
 
@@ -105,6 +105,25 @@ python notebooks/eval_verify_p3.py    # rewrites docs/eval_report_sample1.md
 
 This drives the full `evaluation/` suite (pipeline comparison, per-agent KPI, ablation, trust calibration) on the saved sample-1 artifacts and writes a consolidated Markdown report.
 
+## Green arbitration ablation
+
+To compare the old "separate Arbitrator" design proxy against the current Green-as-Arbitrator design, run:
+
+```bash
+python notebooks/green_arbitration_ablation.py --loan-csv loan_default.csv
+```
+
+The script joins `loan_default.csv` to `text_ana_results/text_analysis_combined.pkl` by LendingClub `id`, writes case-level CSVs under `outputs/green_arbitration_ablation/`, and refreshes [docs/green_arbitration_ablation.md](docs/green_arbitration_ablation.md). It is an arbitration-layer ablation, not a full XGBoost replay: it tests how the trust/arbitration policy changes which text signals are allowed to act.
+
+For an API-backed comparison that calls MiniMax for Strategist, Advocate, old standalone Arbitrator proxy, and Green-as-Arbitrator on the selected cases:
+
+```bash
+MINIMAX_API_KEY=your_key_here \
+python notebooks/green_arbitration_api_eval.py --loan-csv loan_default.csv --limit 200
+```
+
+Aggregate outputs are committed under `outputs/green_arbitration_api_eval/`. Raw borrower-level rows, raw LLM JSON, and logs are intentionally ignored by `.gitignore`.
+
 ### Producing a real `decision_log` (optional but recommended)
 
 `per_agent_kpi` and `loop_dynamics` (sections §3 and §4 of the report) consume a `decision_log` from the iterative training loop. If `data/decision_log_sample1.pkl` exists, `eval_verify_p3.py` loads it; otherwise it falls back to a 4-iter synthetic log and labels the report header accordingly. To dump a real one, add this cell at the end of the training notebook right after `run_iterative_loop` returns:
@@ -123,7 +142,7 @@ The pickle is small (one dict of per-iter records); commit it if you want the pu
 
 Three conventions are load-bearing for stable behavior with the MiniMax-M2.7 backend; preserve them when extending the system.
 
-**1. All LLM calls use JSON output mode.** MiniMax-M2.7 is a thinking model. In free-text mode it leaks `<think>…</think>` blocks or stream-of-consciousness reasoning that exhausts the token budget *before* it ever produces the actual answer — the user-visible output ends up empty or truncated. JSON mode (`response_format_json=True` in `call_llm`) reliably suppresses this. Every agent (Text Analyst, Strategist, Advocate, Green LLM, Arbitrator, Reporter) emits a JSON object that the UI parses locally with `_extract_json_object`.
+**1. All LLM calls use JSON output mode.** MiniMax-M2.7 is a thinking model. In free-text mode it leaks `<think>…</think>` blocks or stream-of-consciousness reasoning that exhausts the token budget *before* it ever produces the actual answer — the user-visible output ends up empty or truncated. JSON mode (`response_format_json=True` in `call_llm`) reliably suppresses this. Every agent (Text Analyst, Strategist, Advocate, Green arbitration / review, Reporter) emits a JSON object that the UI parses locally with `_extract_json_object`.
 
 **2. The Reporter has a deterministic Python fallback.** `_reporter_deterministic_fallback` in [app/ui/Home.py](app/ui/Home.py) synthesises the two-paragraph narrative from the numeric inputs alone — same two-section structure (prediction result / trust assessment), same `effective_weight == 0` vs `> 0` branching as the LLM prompt. It runs whenever the LLM returns invalid or truncated JSON, so the Reporter panel can never show "hidden reasoning only" or a blank box even when the LLM misbehaves.
 

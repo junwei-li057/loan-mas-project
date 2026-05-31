@@ -1,0 +1,7 @@
+event,count
+old_design_acted,578
+new_green_acted,291
+green_suppressed_old_action,287
+old_wrong_new_suppressed,71
+old_right_new_suppressed,216
+extreme_exception_allowed,0

@@ -55,3 +55,14 @@ Thumbs.db
 
 # Executed notebook with API outputs (regenerate locally, do not commit)
 notebooks/loan_default_executed.ipynb
+
+# ── Evaluation raw outputs ────────────────────────────────────────────────────
+# Keep aggregate summaries in git; keep borrower-level rows, raw LLM JSON, and
+# logs local because they contain free-text descriptions / verbose model output.
+outputs/green_arbitration_api_eval/api_eval_results*.csv
+outputs/green_arbitration_api_eval/api_eval_results*.jsonl
+outputs/green_arbitration_api_eval/*.log
+!outputs/green_arbitration_api_eval/api_eval_summary.csv
+!outputs/green_arbitration_api_eval/api_eval_comparison_counts.csv
+!outputs/green_arbitration_api_eval/README.md
+outputs/green_arbitration_ablation/cases_*.csv

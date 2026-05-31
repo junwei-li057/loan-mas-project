@@ -659,7 +659,7 @@ def run_strategist_llm(grade, baseline_pred, text_score, text_confidence,
         "- proposed_weight must equal learned for keep_learned / explanation_only / human_review.\n"
         "- Use a modest increase when historical text impact is unstable or harmful, because the "
         "Advocate may veto and Green will then arbitrate. Do not refuse to propose simply because of "
-        "veto risk — that is what the Advocate and Arbitrator are for.\n"
+        "veto risk — that is what the Advocate and Green arbitration are for.\n"
         "- proposed_weight must be in [0.00, 0.20].\n"
     )
 
@@ -973,9 +973,9 @@ def text_risk_label(score: float) -> str:
 # ── Preset demo cases ─────────────────────────────────────────────────────────
 PRESETS = {
     # Case 1: Grade C, protective text → Strategist proposes weight increase → HARD VETO
-    # Grade C delta=-0.054 < -0.02 → hard veto; Arbitrator enforces (sides with Advocate)
+    # Grade C delta=-0.054 < -0.02 → hard veto; Green enforces subgroup protection.
     # Narrative: borrower sounds trustworthy, but Grade C text historically hurts AUC badly
-    "Case 1 · Grade C — Arbitrator sides with Advocate": {
+    "Case 1 · Grade C — Green enforces hard veto": {
         "grade": "C", "loan_amnt": 14000, "int_rate": 17.5, "installment": 350.0,
         "annual_inc": 68000, "dti": 14.0, "delinq_2yrs": 0, "fico_low": 705,
         "fico_high": 709, "inq_6mths": 1, "open_acc": 12, "pub_rec": 0,
@@ -989,9 +989,9 @@ PRESETS = {
         ),
     },
     # Case 2: Grade E, protective text → Strategist proposes weight increase → SOFT VETO
-    # Grade E delta=-0.018, in range [-0.02, 0) → soft veto; Arbitrator LLM negotiates (sides with Strategist)
+    # Grade E delta=-0.018, in range [-0.02, 0) → soft veto; Green negotiates a constrained compromise.
     # Narrative: similar trustworthy borrower, but Grade E text marginally harmful — room for compromise
-    "Case 2 · Grade E — Arbitrator sides with Strategist": {
+    "Case 2 · Grade E — Green arbitrates soft veto": {
         "grade": "E", "loan_amnt": 14000, "int_rate": 17.5, "installment": 350.0,
         "annual_inc": 68000, "dti": 14.0, "delinq_2yrs": 0, "fico_low": 705,
         "fico_high": 709, "inq_6mths": 1, "open_acc": 12, "pub_rec": 0,
