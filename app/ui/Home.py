@@ -1108,7 +1108,7 @@ PRESETS = {
     # The full Strategist → Advocate → Green flow runs and the verdict flips
     # from DEFAULT to NON-DEFAULT.
     "Case 1 · Grade D — Strong text flips a borderline verdict": {
-        "grade": "D", "loan_amnt": 13500, "int_rate": 14.8, "installment": 320.0,
+        "grade": "D", "loan_amnt": 13000, "int_rate": 14.8, "installment": 320.0,
         "annual_inc": 69000, "dti": 17.5, "delinq_2yrs": 0, "fico_low": 698,
         "fico_high": 702, "inq_6mths": 1, "open_acc": 10, "pub_rec": 0,
         "revol_bal": 7800, "revol_util": 45.0, "total_acc": 20, "mort_acc": 1,
